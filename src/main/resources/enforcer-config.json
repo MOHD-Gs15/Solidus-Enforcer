@@ -1,0 +1,58 @@
+{
+  "license_tiers": {
+    "bronze": { "weekly_cost": 500.0 },
+    "silver": { "weekly_cost": 700.0 },
+    "gold": { "weekly_cost": 1200.0 }
+  },
+  "bounty_limits": {
+    "min_bounty": 500.0,
+    "max_bounty": 1000000.0,
+    "max_active_per_player": 3,
+    "max_bounties_per_target": 5,
+    "bounty_duration_days": 30
+  },
+  "blood_tax": {
+    "enabled": true,
+    "tax_rate": 0.10,
+    "treasury_share": 0.50,
+    "burn_share": 0.50
+  },
+  "contract_fees": {
+    "enabled": true,
+    "daily_rate": 0.01,
+    "minimum_bounty": 100.0,
+    "grace_period_hours": 24
+  },
+  "value_drop_requirement": {
+    "enabled": true,
+    "minimum_gear_ratio": 0.20,
+    "naked_penalty_ratio": 0.05
+  },
+  "alliance_split": {
+    "damage_share": 0.70,
+    "finishing_bonus": 0.30,
+    "tracking_window_seconds": 120
+  },
+  "autonomous_bounties": {
+    "enabled": true,
+    "wealth_monopoly_threshold": 0.40,
+    "kill_streak_threshold": 10,
+    "kd_ratio_threshold": 4.0,
+    "min_auto_bounty": 1000.0,
+    "max_auto_bounty": 50000.0,
+    "check_interval_minutes": 30,
+    "monopoly_bounty_base": 5000.0,
+    "kill_streak_bounty_base": 2000.0
+  },
+  "collusion_detection": {
+    "enabled": true,
+    "transaction_lookback_days": 30,
+    "max_mutual_transactions": 5,
+    "same_claim_penalty": true
+  },
+  "compass": {
+    "update_interval_ticks": 1200,
+    "silver_accuracy_blocks": 50,
+    "gold_accuracy_blocks": 5
+  }
+}

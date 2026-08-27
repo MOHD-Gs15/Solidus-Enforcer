@@ -1,0 +1,41 @@
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Minecraft runtime
+run/
+logs/
+config/
+
+# Databases and runtime state
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+
+# Secrets and credentials
+.env
+*.key
+*.pem
+*.p12
+*.jks
+
+# Archives and generated artifacts
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# Reports and logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "id": "solidus-enforcer",
+  "version": "${version}",
+  "name": "Solidus Enforcer",
+  "description": "Server-side bounty, hunter licensing, anti-exploit, and combat enforcement for Solidus.",
+  "authors": ["MOHD_Gs"],
+  "contact": {
+    "sources": "https://github.com/MOHD-Gs15/Solidus-Enforcer"
+  },
+  "license": "MIT",
+  "environment": "server",
+  "entrypoints": {
+    "server": [
+      "com.solidus.enforcer.SolidusEnforcerMod"
+    ]
+  },
+  "mixins": [
+    "solidus-enforcer.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.4",
+    "minecraft": "~26.1.2",
+    "java": ">=25",
+    "fabric-api": ">=0.155.2+26.1.2"
+  },
+  "suggests": {
+    "solidus": "*"
+  }
+}
