@@ -1,192 +1,184 @@
 package com.solidus.enforcer.combat;
 
-import com.solidus.enforcer.SolidusEnforcerMod;
+import com.solidus.enforcer.bounty.BountyAnnouncer;
 import com.solidus.enforcer.bounty.BountyEntry;
+import com.solidus.enforcer.bounty.BountyManager;
 import com.solidus.enforcer.bounty.BountyStatus;
-import com.solidus.enforcer.economy.TreasuryManager;
+import com.solidus.enforcer.economy.EconomyMath;
 import com.solidus.enforcer.integration.SolidusBridge;
-import com.solidus.enforcer.license.HunterLicenseManager;
 import com.solidus.enforcer.security.AntiExploitEngine;
 import com.solidus.enforcer.storage.EnforcerStorage;
 import com.solidus.enforcer.util.ConfigManager;
 import com.solidus.enforcer.util.TextUtil;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Turns a PvP kill into a settled bounty payout.
+ *
+ * Payout protocol (claim-first — fixes the old pay-then-mark double payout):
+ * <ol>
+ *   <li>Atomically CLAIM every payable bounty on the victim (single storage
+ *       task on the serialized worker; a second simultaneous kill observes an
+ *       empty set).</li>
+ *   <li>Run anti-exploit checks (collusion + value drop on the DEATH-TIME
+ *       inventory snapshot).</li>
+ *   <li>Pay the split (damage pool by contribution, finishing pool to the
+ *       killer) — online via addBalance, offline via addBalanceOffline.</li>
+ *   <li>On any payment failure: REVERT the claim so the bounty returns to
+ *       ACTIVE for the next kill; on success: record stats and announce.</li>
+ * </ol>
+ */
 public final class KillProcessor {
     private static final Logger LOGGER = LoggerFactory.getLogger("Solidus-Enforcer");
+
     private final EnforcerStorage storage;
     private final ConfigManager config;
     private final DamageTracker damageTracker;
     private final AntiExploitEngine antiExploit;
-    private final TreasuryManager treasury;
-    private final HunterLicenseManager licenseManager;
+    private final BountyManager bountyManager;
+    private final com.solidus.enforcer.economy.TreasuryManager treasury;
 
     public KillProcessor(EnforcerStorage storage, ConfigManager config, DamageTracker damageTracker,
-                         AntiExploitEngine antiExploit, TreasuryManager treasury,
-                         HunterLicenseManager licenseManager) {
+                         AntiExploitEngine antiExploit, BountyManager bountyManager,
+                         com.solidus.enforcer.economy.TreasuryManager treasury) {
         this.storage = storage;
         this.config = config;
         this.damageTracker = damageTracker;
         this.antiExploit = antiExploit;
+        this.bountyManager = bountyManager;
         this.treasury = treasury;
-        this.licenseManager = licenseManager;
     }
 
-    public void processKill(ServerPlayer victim, ServerPlayer killer, MinecraftServer server) {
+    /**
+     * @param inventorySnapshot gear value captured synchronously at death time
+     */
+    public void processKill(ServerPlayer victim, ServerPlayer killer, double inventorySnapshot, MinecraftServer server) {
         UUID victimUuid = victim.getUUID();
-        this.storage.getBountiesForTarget(victimUuid).thenAcceptAsync(bounties -> {
-            if (bounties.isEmpty()) {
+        this.storage.claimBountiesForTarget(victimUuid).thenAcceptAsync(claimed -> {
+            if (claimed.isEmpty()) {
                 return;
             }
-            double totalBounty = bounties.stream().mapToDouble(BountyEntry::totalAmount).sum();
+            double totalBounty = claimed.stream().mapToDouble(BountyEntry::totalAmount).sum();
             if (!Double.isFinite(totalBounty) || totalBounty <= 0.0) {
-                LOGGER.error("Ignoring invalid total bounty {} for victim {}", totalBounty, victimUuid);
+                LOGGER.error("Claimed bounties for {} total {} — reverting claim", victimUuid, totalBounty);
+                this.revert(claimed);
                 return;
             }
-            this.antiExploit.runAllChecks(victim, killer, totalBounty)
-                .thenComposeAsync(exploitResult -> this.damageTracker.getDamageContributions(victimUuid)
-                    .thenComposeAsync(contributions -> {
-                        double adjustedBounty = totalBounty * exploitResult.payoutRatio();
-                        return this.distributeReward(victim, killer, contributions, adjustedBounty, exploitResult, server);
-                    }))
-                .thenAcceptAsync(paid -> server.execute(() -> {
-                    if (!paid) {
-                        LOGGER.error("Bounty payout failed for victim {}; leaving bounties claimable for recovery", victimUuid);
-                        return;
-                    }
-                    for (BountyEntry bounty : bounties) {
-                        this.storage.updateBountyStatus(bounty.id(), BountyStatus.CLAIMED);
-                    }
-                    this.damageTracker.clearRecords(victimUuid);
-                    this.storage.recordKill(killer.getUUID(), killer.getName().getString(), victimUuid, victim.getName().getString());
-                }))
-                .exceptionally(error -> {
-                    LOGGER.error("Bounty processing failed for victim {}", victimUuid, error);
-                    return null;
-                });
+
+            this.antiExploit.collusionDetector()
+                    .checkForCollusion(killer.getUUID(), killer.getName().getString(),
+                            victimUuid, victim.getName().getString())
+                    .thenCompose(collusion -> this.antiExploit.evaluate(collusion, inventorySnapshot, totalBounty))
+                    .thenCompose(exploitResult -> {
+                        if (exploitResult.payoutRatio() <= 0.0) {
+                            // Fraud: confiscate the claimed bounties to the treasury.
+                            return this.confiscateClaimed(claimed, exploitResult, victim, killer, server)
+                                    .thenApply(ignored -> true);
+                        }
+                        double payable = EconomyMath.round2(totalBounty * exploitResult.payoutRatio());
+                        return this.damageTracker.getDamageContributions(victimUuid)
+                                .thenCompose(contributions ->
+                                        this.settlePayout(claimed, victim, killer, contributions,
+                                                payable, exploitResult, totalBounty, server));
+                    })
+                    .exceptionally(error -> {
+                        LOGGER.error("Bounty settlement failed for victim {} — reverting claim", victimUuid, error);
+                        this.revert(claimed);
+                        return null;
+                    });
         });
     }
 
-    private CompletableFuture<Boolean> distributeReward(ServerPlayer victim, ServerPlayer killer,
-                                                          Map<UUID, Double> damageContributions,
-                                                          double totalReward,
-                                                          AntiExploitEngine.ExploitCheckResult exploitResult,
-                                                          MinecraftServer server) {
-        if (!SolidusBridge.isAvailable() || !Double.isFinite(totalReward) || totalReward <= 0.0) {
-            LOGGER.error("Cannot distribute invalid reward or use unavailable Solidus Core: {}", totalReward);
-            return CompletableFuture.completedFuture(false);
-        }
-        double damageShare = clamp(this.config.getAllianceDamageShare(), 0.0, 1.0);
-        double finishingShare = clamp(this.config.getAllianceFinishingBonus(), 0.0, 1.0);
-        double shareTotal = damageShare + finishingShare;
-        if (shareTotal <= 0.0) {
-            finishingShare = 1.0;
-            damageShare = 0.0;
-        } else if (shareTotal > 1.0) {
-            damageShare /= shareTotal;
-            finishingShare /= shareTotal;
-        }
-        double totalDamage = damageContributions.values().stream()
-            .filter(value -> value != null && Double.isFinite(value) && value > 0.0)
-            .mapToDouble(Double::doubleValue)
-            .sum();
-        if (totalDamage <= 0.0) {
-            return payRecipient(killer.getUUID(), killer, totalReward, victim, server)
-                .thenApply(paid -> {
-                    if (paid) {
-                        server.execute(() -> this.announceClaim(victim, killer, totalReward, exploitResult, server));
-                    }
-                    return paid;
-                });
-        }
+    private CompletableFuture<Void> settlePayout(List<BountyEntry> claimed, ServerPlayer victim,
+                                                 ServerPlayer killer, Map<UUID, Double> contributions,
+                                                 double payable, AntiExploitEngine.ExploitCheckResult exploitResult,
+                                                 double totalBounty, MinecraftServer server) {
+        EconomyMath.PayoutSplit split = EconomyMath.allianceSplit(payable,
+                this.config.getAllianceDamageShare(), this.config.getAllianceFinishingBonus());
 
-        double damagePool = totalReward * damageShare;
-        double finishingPool = totalReward * finishingShare;
-        LinkedHashMap<UUID, Double> payouts = new LinkedHashMap<>();
-        for (Map.Entry<UUID, Double> entry : damageContributions.entrySet()) {
-            double attackerDamage = entry.getValue() == null ? 0.0 : entry.getValue();
-            if (!Double.isFinite(attackerDamage) || attackerDamage <= 0.0) {
-                continue;
-            }
-            payouts.merge(entry.getKey(), damagePool * attackerDamage / totalDamage, Double::sum);
-        }
-        payouts.merge(killer.getUUID(), finishingPool, Double::sum);
+        LinkedHashMap<UUID, Double> payouts = EconomyMath.damageShares(contributions, split.damagePool());
+        payouts.merge(killer.getUUID(), split.finishingPool(), Double::sum);
 
-        List<CompletableFuture<Boolean>> payments = new ArrayList<>();
-        for (Map.Entry<UUID, Double> entry : payouts.entrySet()) {
-            double amount = entry.getValue();
-            if (!Double.isFinite(amount) || amount <= 0.0) {
-                return CompletableFuture.completedFuture(false);
-            }
-            ServerPlayer recipient = server.getPlayerList().getPlayer(entry.getKey());
-            payments.add(payRecipient(entry.getKey(), recipient, amount, victim, server));
-        }
-        return CompletableFuture.allOf(payments.toArray(CompletableFuture[]::new))
-            .thenApply(ignored -> {
-                boolean paid = payments.stream().allMatch(CompletableFuture::join);
-                if (paid) {
-                    server.execute(() -> this.announceClaim(victim, killer, totalReward, exploitResult, server));
-                }
-                return paid;
-            });
+        return this.damageTracker.getAttackerNames(victim.getUUID()).thenCompose(names -> {
+            names.putIfAbsent(killer.getUUID(), killer.getName().getString());
+
+            List<CompletableFuture<Boolean>> payments = payouts.entrySet().stream()
+                    .filter(entry -> entry.getValue() != null && Double.isFinite(entry.getValue()) && entry.getValue() > 0.0)
+                    .map(entry -> this.payRecipient(entry.getKey(), names.get(entry.getKey()),
+                            entry.getValue(), victim, server))
+                    .toList();
+
+            return CompletableFuture.allOf(payments.toArray(CompletableFuture[]::new))
+                    .thenApply(ignored -> payments.stream().allMatch(CompletableFuture::join))
+                    .thenCompose(allPaid -> {
+                        if (!allPaid) {
+                            LOGGER.error("Partial payout failure for victim {} — reverting {} bounties",
+                                    victim.getUUID(), claimed.size());
+                            this.revert(claimed);
+                            return CompletableFuture.completedFuture(false);
+                        }
+                        return this.storage.recordKill(killer.getUUID(), killer.getName().getString(),
+                                        victim.getUUID(), victim.getName().getString())
+                                .thenCompose(v -> this.damageTracker.clearRecords(victim.getUUID()))
+                                .thenRun(() -> server.execute(() -> BountyAnnouncer.announceClaim(
+                                        claimed, victim, killer, totalBounty, payable, exploitResult, server,
+                                        payouts)))
+                                .thenApply(v -> true);
+                    });
+        });
     }
 
-    private CompletableFuture<Boolean> payRecipient(UUID recipientUuid, ServerPlayer recipient,
-                                                     double amount, ServerPlayer victim,
-                                                     MinecraftServer server) {
-        CompletableFuture<Double> payment = recipient != null
-            ? SolidusBridge.addBalance(recipient, amount)
-            : SolidusBridge.addBalanceOffline(recipientUuid, "Unknown", amount);
+    /** Collusion path: bounties are cancelled and their value confiscated. */
+    private CompletableFuture<Void> confiscateClaimed(List<BountyEntry> claimed,
+                                                      AntiExploitEngine.ExploitCheckResult exploitResult,
+                                                      ServerPlayer victim, ServerPlayer killer, MinecraftServer server) {
+        double confiscated = claimed.stream().mapToDouble(BountyEntry::totalAmount).sum();
+        CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
+        for (BountyEntry bounty : claimed) {
+            tail = tail.thenCompose(v -> this.storage.updateBountyStatus(bounty.id(), BountyStatus.CANCELLED));
+        }
+        return tail.thenCompose(v -> this.storage.adjustTreasury(
+                        com.solidus.enforcer.economy.TreasuryManager.Category.CONFISCATION, confiscated,
+                        "collusion: bounty on " + victim.getName().getString()))
+                .thenAccept(this.treasury::applySnapshot)
+                .thenRun(() -> server.execute(() -> BountyAnnouncer.announceDenial(
+                        victim, killer, exploitResult.message(), confiscated, server)));
+    }
+
+    /** Compensation path: puts an interrupted payout back up for grabs. */
+    private void revert(List<BountyEntry> claimed) {
+        this.storage.revertClaim(claimed.stream().map(BountyEntry::id).toList());
+    }
+
+    private CompletableFuture<Boolean> payRecipient(UUID recipientUuid, String recipientName,
+                                                    double amount, ServerPlayer victim, MinecraftServer server) {
+        ServerPlayer online = server.getPlayerList().getPlayer(recipientUuid);
+        String name = recipientName == null ? "Unknown" : recipientName;
+        CompletableFuture<Double> payment = online != null
+                ? SolidusBridge.addBalance(online, amount)
+                : SolidusBridge.addBalanceOffline(recipientUuid, name, amount);
         return payment.handle((newBalance, error) -> {
             if (error != null || newBalance == null || !Double.isFinite(newBalance) || newBalance < 0.0) {
-                LOGGER.error("Failed to pay bounty recipient {} amount {}", recipientUuid, amount, error);
+                LOGGER.error("Failed to pay bounty share {} to {} ({})", amount, name, recipientUuid, error);
                 return false;
             }
-            if (recipient != null) {
-                server.execute(() -> recipient.sendSystemMessage(TextUtil.prefix()
-                    .append(Component.literal("Bounty Reward! ").withColor(0x55FF55))
-                    .append(TextUtil.currency(amount))
-                    .append(Component.literal(" for eliminating ").withColor(0xAAAAAA))
-                    .append(TextUtil.target(victim.getName().getString()))));
+            if (online != null) {
+                server.execute(() -> online.sendSystemMessage(TextUtil.prefix()
+                        .append(Component.literal("Bounty Reward! ").withColor(TextUtil.COLOR_GOOD))
+                        .append(TextUtil.currency(amount))
+                        .append(Component.literal(" for eliminating ").withColor(TextUtil.COLOR_INFO))
+                        .append(TextUtil.target(victim.getName().getString()))));
             }
             return true;
         });
-    }
-
-    private static double clamp(double value, double min, double max) {
-        return Double.isFinite(value) ? Math.max(min, Math.min(max, value)) : min;
-    }
-
-    private void announceClaim(ServerPlayer victim, ServerPlayer killer, double totalReward,
-                               AntiExploitEngine.ExploitCheckResult exploitResult, MinecraftServer server) {
-        MutableComponent announcement = TextUtil.bountyIcon()
-            .append(Component.literal("BOUNTY CLAIMED!").withColor(0xFF3333))
-            .append(Component.literal("\n"))
-            .append(TextUtil.separator())
-            .append(Component.literal("\n  Target: ").withColor(0xAAAAAA))
-            .append(TextUtil.target(victim.getName().getString()))
-            .append(Component.literal("\n  Eliminated by: ").withColor(0xAAAAAA))
-            .append(TextUtil.player(killer.getName().getString()))
-            .append(Component.literal("\n  Reward: ").withColor(0xAAAAAA))
-            .append(TextUtil.currency(totalReward));
-        if (!exploitResult.legitimate()) {
-            announcement = announcement.append(Component.literal("\n  Note: ").withColor(0xFFAA00))
-                .append(Component.literal(exploitResult.message()).withColor(0xFFAA00));
-        }
-        announcement = announcement.append(Component.literal("\n")).append(TextUtil.separator());
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            player.sendSystemMessage(announcement);
-        }
     }
 }

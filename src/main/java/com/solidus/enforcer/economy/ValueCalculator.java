@@ -1,37 +1,56 @@
-/*
- * Decompiled with CFR 0.152.
- *
- * Could not load the following classes:
- *  net.minecraft.core.registries.BuiltInRegistries
- *  net.minecraft.server.level.ServerPlayer
- *  net.minecraft.world.entity.player.Inventory
- *  net.minecraft.world.item.ItemStack
- */
 package com.solidus.enforcer.economy;
 
 import com.solidus.enforcer.integration.SolidusBridge;
-import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.item.ItemStack;
 
+/**
+ * Estimates the market value of a player's carried gear using the live shop
+ * price table. Prices are cached by the bridge (30-minute TTL), so the kill
+ * pipeline never performs reflection per item.
+ *
+ * Contract: requiredValue = bounty * minimumGearRatio; payout scales linearly
+ * down to the naked-penalty floor when the victim carries less (see
+ * {@link EconomyMath#payoutRatio}).
+ */
 public final class ValueCalculator {
     private ValueCalculator() {
     }
 
+    /**
+     * Synchronous inventory valuation — must be called at death time on the
+     * tick thread, BEFORE any async hop, because the victim may respawn and
+     * rebuild their inventory while the payout pipeline is still running.
+     */
     public static double calculateInventoryValue(ServerPlayer player) {
-        double totalValue = 0.0;
         Inventory inv = player.getInventory();
+        double total = 0.0;
         for (ItemStack stack : inv.getNonEquipmentItems()) {
-            totalValue += ValueCalculator.getItemValue(stack);
+            total += getItemValue(stack);
         }
-        for (int i = 36; i <= 39; ++i) {
-            totalValue += ValueCalculator.getItemValue(inv.getItem(i));
+        for (int i = 36; i <= 39; i++) {
+            total += getItemValue(inv.getItem(i));
         }
-        ItemStack offhand = inv.getItem(40);
-        return totalValue += ValueCalculator.getItemValue(offhand);
+        total += getItemValue(inv.getItem(40));
+        return EconomyMath.round2(total);
+    }
+
+    public record ValueCheckResult(double inventoryValue, double requiredValue, boolean passed) {
+        public double payoutRatio(double nakedPenaltyRatio) {
+            return EconomyMath.payoutRatio(this.requiredValue, this.inventoryValue,
+                    1.0, nakedPenaltyRatio);
+        }
+    }
+
+    public static ValueCheckResult checkValueDropRequirement(double inventoryValue,
+                                                             double totalBounty,
+                                                             double minimumGearRatio) {
+        double required = EconomyMath.round2(totalBounty * minimumGearRatio);
+        return new ValueCheckResult(inventoryValue, required, inventoryValue >= required);
     }
 
     private static double getItemValue(ItemStack stack) {
@@ -42,50 +61,13 @@ public final class ValueCalculator {
         if (itemKey == null) {
             return 0.0;
         }
-        String material = itemKey.getPath().toUpperCase(java.util.Locale.ROOT);
-        Double sellPrice = ValueCalculator.lookupSellPrice(material);
-        if (sellPrice != null && sellPrice > 0.0) {
-            return sellPrice * (double)stack.getCount();
-        }
-        return 0.0;
+        String material = itemKey.getPath().toUpperCase(Locale.ROOT);
+        Double sellPrice = lookupSellPrice(material);
+        return sellPrice == null ? 0.0 : sellPrice * stack.getCount();
     }
 
     private static Double lookupSellPrice(String material) {
-        try {
-            Map<String, List<SolidusBridge.ShopItemData>> sections = SolidusBridge.getShopSections();
-            if (sections.isEmpty()) {
-                return null;
-            }
-            for (Map.Entry<String, List<SolidusBridge.ShopItemData>> entry : sections.entrySet()) {
-                for (SolidusBridge.ShopItemData item : entry.getValue()) {
-                    if (!material.equals(item.material())) continue;
-                    return item.sellPrice();
-                }
-            }
-        }
-        catch (Exception exception) {
-            // empty catch block
-        }
-        return null;
-    }
-
-    public static ValueCheckResult checkValueDropRequirement(ServerPlayer player, double bountyAmount, double minimumGearRatio) {
-        double requiredValue;
-        double inventoryValue = ValueCalculator.calculateInventoryValue(player);
-        boolean passed = inventoryValue >= (requiredValue = bountyAmount * minimumGearRatio);
-        return new ValueCheckResult(passed, inventoryValue, requiredValue, bountyAmount, minimumGearRatio);
-    }
-
-    public record ValueCheckResult(boolean passed, double inventoryValue, double requiredValue, double bountyAmount, double requiredRatio) {
-        public double getPayoutRatio(double nakedPenaltyRatio) {
-            if (this.passed) {
-                return 1.0;
-            }
-            double ratio = this.inventoryValue / this.requiredValue;
-            if (ratio <= 0.01) {
-                return nakedPenaltyRatio;
-            }
-            return nakedPenaltyRatio + ratio * (1.0 - nakedPenaltyRatio);
-        }
+        Map<String, Double> prices = SolidusBridge.getShopSellPrices();
+        return prices.get(material);
     }
 }

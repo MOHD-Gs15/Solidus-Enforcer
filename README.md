@@ -1,30 +1,65 @@
-# Solidus Enforcer
+# Solidus Enforcer — Bounty & Enforcement Layer
 
-Server-side bounty, hunter licensing, combat tracking, anti-exploit, and collusion detection for Solidus on Minecraft Java 26.1.2.
+[![Platform](https://img.shields.io/badge/Platform-Fabric-blue.svg)](https://fabricmc.net/)
+[![Minecraft](https://img.shields.io/badge/Minecraft-26.1.2-green.svg)](https://www.minecraft.net/)
+[![Java](https://img.shields.io/badge/Java-25-orange.svg)](https://adoptium.net/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## Status
+**Bounty hunting, hunter licenses, alliance payouts, anti-exploit enforcement and collusion detection for the Solidus economy ecosystem — 100% server-side.**
 
-This repository is a clean source reconstruction of the recovered `solidus-enforcer` artifact. The recovered Java files were decompiled with CFR, so this implementation is being rebuilt and audited rather than treated as authoritative original source. The project is intended to remain server-only and to fail closed when Solidus Core is unavailable.
+*Rebuilt v1.1: this codebase was reconstructed from a decompiled artifact and then re-audited end to end. Every money path is now atomic, the tick thread never blocks, and every advertised feature actually exists. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).*
+
+---
+
+## What it does
+
+| Feature | Description |
+|---|---|
+| **Bounties** | Players place S$ bounties on others; a blood tax splits part to the treasury and part to the burn sink. Bounties decay daily (contract fees) and refund on expiry. |
+| **Hunter licenses** | Weekly BRONZE / SILVER / GOLD tiers gate the bounty board and unlock intel (K/D, playtime, wealth) plus tracking compasses. |
+| **Alliance payouts** | Kill rewards split between damage contributors (proportional, tracked window) and the finishing bonus (killer). |
+| **Anti-exploit** | Value-drop check scales payouts by the victim's death-time gear value; collusion analysis flags kill farming, mutual swaps and money loops. |
+| **Autonomous bounties** | The Enforcer funds bounties from the treasury on wealth monopolists and rampage streaks — atomically, with rollback. |
+| **Treasury** | Single-row ledger-backed economy sink with full audit trail (`/enforcer treasury`, `/enforcer ledger`). |
+
+## Commands
+
+```
+/hunter                         license menu
+/hunter tiers                   perks + prices
+/hunter buy <bronze|silver|gold>
+/hunter info                    your license status
+/hunter track <player>          tracking compass (SILVER+ license, active bounty required)
+
+/bounty place <player> <amount>
+/bounty list [page]
+/bounty info <name>             works for OFFLINE targets
+/bounty top
+
+/enforcer treasury              (admin) balance + totals
+/enforcer ledger [lines]        (admin) audit trail
+/enforcer bounties              (admin) all active bounties
+/enforcer cancel <id>           (admin) confiscate a bounty to the treasury
+/enforcer stats                 (admin) top hunters
+/enforcer reload                (admin) reload config
+```
 
 ## Compatibility
 
-| Component | Version |
+| Component | Requirement |
 | --- | --- |
-| Minecraft | 26.1.2 |
-| Fabric Loader | 0.19.4 or newer |
+| Minecraft | 26.1.2 (Mojang mappings) |
+| Loader | Fabric 0.19.4+ |
 | Fabric API | 0.155.2+26.1.2 |
-| Fabric Loom | 1.16-SNAPSHOT (resolves to 1.16.3 in the current environment) |
-| Java | 25 or newer |
+| Java | 25 |
+| Solidus Core | Optional — economy features fail closed without it |
 
-## Features
+## Fail-closed design
 
-Solidus Enforcer provides configurable bounties, hunter licenses, damage contribution tracking, treasury accounting, anti-exploit checks, collusion flags, combat rewards, and optional autonomous bounty processing. Solidus Core is discovered at runtime through a compatibility bridge; without Core, economy-dependent operations are disabled rather than simulated.
-
-## Security and operational notes
-
-The project stores its local state under `config/solidus-enforcer/enforcer.db`. Runtime databases, logs, license data, and credentials are intentionally ignored by Git. Economy operations are asynchronous and must be validated against the exact Solidus Core API version installed on the server. The source reconstruction has not yet been validated by a full Dedicated Server integration test.
-
-Read [SECURITY.md](SECURITY.md) before deploying. In particular, do not expose license secrets or treat a successful compilation as proof that bounty payments are transactionally safe.
+Without Solidus Core the mod boots, serves its state and *refuses* every
+economy action with a clear message instead of simulating success. Storage
+lives in `config/solidus-enforcer/enforcer.db` (WAL SQLite, single-thread
+worker) and is fully independent of Core's databases.
 
 ## Build
 
@@ -33,8 +68,6 @@ Read [SECURITY.md](SECURITY.md) before deploying. In particular, do not expose l
 ./gradlew build
 ```
 
-The mod JAR is written to `build/libs`. The build uses Mojang names for Minecraft 26.1.2 and Java 25.
-
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Part of the [Solidus Economy Ecosystem](https://github.com/mohd-gs).

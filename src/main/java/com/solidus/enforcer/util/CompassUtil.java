@@ -1,24 +1,7 @@
-/*
- * Decompiled with CFR 0.152.
- *
- * Could not load the following classes:
- *  net.minecraft.core.BlockPos
- *  net.minecraft.core.GlobalPos
- *  net.minecraft.core.component.DataComponents
- *  net.minecraft.network.chat.Component
- *  net.minecraft.network.chat.MutableComponent
- *  net.minecraft.server.level.ServerLevel
- *  net.minecraft.world.item.ItemStack
- *  net.minecraft.world.item.Items
- *  net.minecraft.world.item.component.ItemLore
- *  net.minecraft.world.item.component.LodestoneTracker
- *  net.minecraft.world.level.ItemLike
- *  org.jetbrains.annotations.Nullable
- */
 package com.solidus.enforcer.util;
 
-import com.solidus.enforcer.util.TextUtil;
 import java.util.ArrayList;
+import java.util.Locale;
 import java.util.Optional;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.GlobalPos;
@@ -33,52 +16,74 @@ import net.minecraft.world.item.component.LodestoneTracker;
 import net.minecraft.world.level.ItemLike;
 import org.jetbrains.annotations.Nullable;
 
+/**
+ * Builds hunter tracking compasses. SILVER holders get a fuzzy static fix on
+ * the target's last known position; GOLD holders get near-exact coordinates
+ * and a live-refresh component (see TrackerService).
+ */
 public final class CompassUtil {
+    /** Marker embedded in the lore so TrackerService can find its compasses. */
+    public static final String TRACK_MARKER = "solidus-track";
+
     private CompassUtil() {
     }
 
-    public static ItemStack createTrackingCompass(String targetName, @Nullable String targetDim, int targetX, int targetZ, String tier) {
-        ItemStack compass = new ItemStack((ItemLike)Items.COMPASS);
-        MutableComponent displayName = TextUtil.licenseIcon().append((Component)Component.literal((String)"Tracking: ").withColor(0x55FFFF)).append((Component)TextUtil.target(targetName));
+    public static ItemStack createTrackingCompass(String targetName, @Nullable String targetDim,
+                                                  int targetX, int targetY, int targetZ,
+                                                  String tier, int accuracyBlocks) {
+        ItemStack compass = new ItemStack((ItemLike) Items.COMPASS);
+        MutableComponent displayName = TextUtil.licenseIcon()
+                .append(Component.literal("Tracking: ").withColor(TextUtil.COLOR_BRAND))
+                .append(TextUtil.target(targetName));
         compass.set(DataComponents.CUSTOM_NAME, displayName);
-        ArrayList<Component> lore = new ArrayList<Component>();
-        lore.add(TextUtil.compassIcon().append((Component)Component.literal((String)"Points to target's last known location").withColor(0xAAAAAA)));
-        if ("GOLD".equalsIgnoreCase(tier)) {
-            lore.add(Component.literal((String)"  Real-time tracking (5-block accuracy)").withColor(16766720));
-        } else {
-            lore.add(Component.literal((String)"  Updates every 60s (50-block accuracy)").withColor(0xC0C0C0));
-        }
+
+        ArrayList<Component> lore = new ArrayList<>();
+        lore.add(TextUtil.compassIcon()
+                .append(Component.literal("Points to " + targetName + "'s tracked position")
+                        .withColor(TextUtil.COLOR_INFO)));
+        lore.add(Component.literal("  [" + TRACK_MARKER + "]").withColor(0x444444));
+        lore.add(Component.literal("  Accuracy: \u00B1" + accuracyBlocks + " blocks")
+                .withColor(TextUtil.COLOR_SILVER));
         if (targetDim != null) {
-            lore.add(Component.literal((String)("  Dimension: " + CompassUtil.formatDimension(targetDim))).withColor(0x777777));
+            lore.add(Component.literal("  Dimension: " + formatDimension(targetDim))
+                    .withColor(TextUtil.COLOR_MUTED));
         }
         lore.add(TextUtil.thinSeparator());
-        lore.add(Component.literal((String)"  Expires when bounty is claimed/cancelled").withColor(0x777777));
+        lore.add(Component.literal("  Tier: " + tier).withColor(TextUtil.COLOR_MUTED));
         compass.set(DataComponents.LORE, new ItemLore(lore));
         return compass;
     }
 
-    public static ItemStack createLiveTrackingCompass(String targetName, ServerLevel level, int targetX, int targetZ, String tier) {
-        ItemStack compass = CompassUtil.createTrackingCompass(targetName, level.dimension().identifier().toString(), targetX, targetZ, tier);
-        try {
-            GlobalPos targetPos = new GlobalPos(level.dimension(), new BlockPos(targetX, 64, targetZ));
-            LodestoneTracker tracker = new LodestoneTracker(Optional.of(targetPos), true);
-            compass.set(DataComponents.LODESTONE_TRACKER, tracker);
-        }
-        catch (Exception exception) {
-            // empty catch block
-        }
+    public static ItemStack createLiveTrackingCompass(String targetName, ServerLevel level,
+                                                      int targetX, int targetY, int targetZ,
+                                                      String tier, int accuracyBlocks) {
+        ItemStack compass = createTrackingCompass(targetName,
+                level.dimension().identifier().toString(), targetX, targetY, targetZ, tier, accuracyBlocks);
+        applyTracker(compass, level, targetX, targetY, targetZ);
         return compass;
     }
 
-    public static void updateCompassTarget(ItemStack compass, ServerLevel level, int targetX, int targetZ) {
+    public static void applyTracker(ItemStack compass, ServerLevel level, int x, int y, int z) {
         try {
-            GlobalPos targetPos = new GlobalPos(level.dimension(), new BlockPos(targetX, 64, targetZ));
-            LodestoneTracker tracker = new LodestoneTracker(Optional.of(targetPos), true);
-            compass.set(DataComponents.LODESTONE_TRACKER, tracker);
+            GlobalPos targetPos = new GlobalPos(level.dimension(), new BlockPos(x, y, z));
+            compass.set(DataComponents.LODESTONE_TRACKER, new LodestoneTracker(Optional.of(targetPos), true));
+        } catch (Exception ignored) {
+            // Tracker component quirks must never crash a kill event.
         }
-        catch (Exception exception) {
-            // empty catch block
+    }
+
+    /** Fuzzes coordinates down to the tier accuracy so SILVER is not exact. */
+    public static int fuzz(int coordinate, int accuracyBlocks, java.util.random.RandomGenerator random) {
+        if (accuracyBlocks <= 1) {
+            return coordinate;
         }
+        int spread = accuracyBlocks / 2;
+        int offset = spread == 0 ? 0 : random.nextInt(-spread, spread + 1);
+        return coordinate + offset;
+    }
+
+    public static String dimensionKey(ServerLevel level) {
+        return level.dimension().identifier().toString();
     }
 
     private static String formatDimension(String dimKey) {

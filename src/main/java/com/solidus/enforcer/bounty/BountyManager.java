@@ -1,15 +1,6 @@
-/*
- * Decompiled with CFR 0.152.
- *
- * Could not load the following classes:
- *  net.minecraft.server.level.ServerPlayer
- *  org.slf4j.Logger
- *  org.slf4j.LoggerFactory
- */
 package com.solidus.enforcer.bounty;
 
-import com.solidus.enforcer.bounty.BountyEntry;
-import com.solidus.enforcer.bounty.BountyStatus;
+import com.solidus.enforcer.economy.EconomyMath;
 import com.solidus.enforcer.economy.TreasuryManager;
 import com.solidus.enforcer.integration.SolidusBridge;
 import com.solidus.enforcer.storage.EnforcerStorage;
@@ -18,12 +9,27 @@ import com.solidus.enforcer.util.TextUtil;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Bounty placement, decay, expiry and admin cancellation.
+ *
+ * Money safety rules enforced here:
+ * <ul>
+ *   <li>Payment is a single atomic {@code subtractBalance} — the old
+ *       check-then-subtract TOCTOU is gone.</li>
+ *   <li>Every late failure (DB insert) triggers an automatic refund attempt
+ *       and a loud log if the refund itself fails.</li>
+ *   <li>Tax moves are ledgered through the storage worker and the in-memory
+ *       treasury mirror is updated from the DB snapshot, never eagerly.</li>
+ * </ul>
+ */
 public final class BountyManager {
-    private static final Logger LOGGER = LoggerFactory.getLogger((String)"Solidus-Enforcer");
+    private static final Logger LOGGER = LoggerFactory.getLogger("Solidus-Enforcer");
+
     private final EnforcerStorage storage;
     private final ConfigManager config;
     private final TreasuryManager treasury;
@@ -35,127 +41,189 @@ public final class BountyManager {
     }
 
     public CompletableFuture<BountyResult> placeBounty(ServerPlayer placer, ServerPlayer target, double amount) {
-        UUID targetUuid;
+        UUID placerUuid = placer.getUUID();
+        UUID targetUuid = target.getUUID();
         String targetName = target.getName().getString();
         String placerName = placer.getName().getString();
-        UUID placerUuid = placer.getUUID();
-        if (placerUuid.equals(targetUuid = target.getUUID())) {
-            return CompletableFuture.completedFuture(new BountyResult(false, "You cannot place a bounty on yourself!", 0.0, 0.0));
+
+        if (placerUuid.equals(targetUuid)) {
+            return CompletableFuture.completedFuture(BountyResult.fail("You cannot place a bounty on yourself"));
         }
         if (!Double.isFinite(amount) || amount <= 0.0) {
-            return CompletableFuture.completedFuture(new BountyResult(false, "Bounty amount must be a finite positive number", amount, 0.0));
+            return CompletableFuture.completedFuture(BountyResult.fail("Bounty amount must be a positive number"));
         }
         if (amount < this.config.getMinBounty()) {
-            return CompletableFuture.completedFuture(new BountyResult(false, "Minimum bounty is " + TextUtil.currency(this.config.getMinBounty()).getString(), amount, 0.0));
+            return CompletableFuture.completedFuture(BountyResult.fail(
+                    "Minimum bounty is " + TextUtil.currency(this.config.getMinBounty()).getString()));
         }
         if (amount > this.config.getMaxBounty()) {
-            return CompletableFuture.completedFuture(new BountyResult(false, "Maximum bounty is " + TextUtil.currency(this.config.getMaxBounty()).getString(), amount, 0.0));
+            return CompletableFuture.completedFuture(BountyResult.fail(
+                    "Maximum bounty is " + TextUtil.currency(this.config.getMaxBounty()).getString()));
         }
         if (!SolidusBridge.isAvailable()) {
-            return CompletableFuture.completedFuture(new BountyResult(false, "Economy system not available", amount, 0.0));
+            return CompletableFuture.completedFuture(BountyResult.fail("Economy system is not available"));
         }
-        return this.storage.getActiveBountyCountByPlacer(placerUuid).thenComposeAsync(activeCount -> {
-            if (activeCount >= this.config.getMaxActivePerPlayer()) {
-                return CompletableFuture.completedFuture(new BountyResult(false, "You already have " + activeCount + " active bounties (max: " + this.config.getMaxActivePerPlayer() + ")", amount, 0.0));
+
+        return this.storage.getActiveBountyCountByPlacer(placerUuid).thenCompose(activeByPlacer -> {
+            if (activeByPlacer >= this.config.getMaxActivePerPlayer()) {
+                return CompletableFuture.completedFuture(BountyResult.fail(
+                        "You already have " + activeByPlacer + " active bounties (max: "
+                                + this.config.getMaxActivePerPlayer() + ")"));
             }
-            return this.storage.getActiveBountyCountForTarget(targetUuid).thenComposeAsync(targetCount -> {
-                if (targetCount >= this.config.getMaxBountiesPerTarget()) {
-                    return CompletableFuture.completedFuture(new BountyResult(false, targetName + " already has " + targetCount + " bounties (max: " + this.config.getMaxBountiesPerTarget() + ")", amount, 0.0));
+            return this.storage.getActiveBountyCountForTarget(targetUuid).thenCompose(activeOnTarget -> {
+                if (activeOnTarget >= this.config.getMaxBountiesPerTarget()) {
+                    return CompletableFuture.completedFuture(BountyResult.fail(
+                            targetName + " already carries " + activeOnTarget + " bounties (max: "
+                                    + this.config.getMaxBountiesPerTarget() + ")"));
                 }
-                final double amountToDeduct = amount;
-                return SolidusBridge.hasSufficientBalance(placer, amountToDeduct).thenComposeAsync(hasFunds -> {
-                    if (!hasFunds.booleanValue()) {
-                        return CompletableFuture.completedFuture(new BountyResult(false, "Insufficient balance. You need " + TextUtil.currency(amountToDeduct).getString(), amountToDeduct, 0.0));
-                    }
-                    return SolidusBridge.subtractBalance(placer, amountToDeduct).thenComposeAsync(newBalance -> {
-                        if (newBalance == null || newBalance < 0.0) {
-                            return CompletableFuture.completedFuture(new BountyResult(false, "Payment failed", amountToDeduct, 0.0));
-                        }
-                        TreasuryManager.TaxResult taxResult = this.treasury.processBloodTax(amountToDeduct);
-                        double bountyAmount = taxResult.remainingBounty();
-                        if (!Double.isFinite(bountyAmount) || bountyAmount <= 0.0) {
-                            return SolidusBridge.addBalance(placer, amountToDeduct)
-                                .thenApply(refundBalance -> new BountyResult(false,
-                                    refundBalance != null && refundBalance >= 0.0
-                                        ? "Bounty amount became invalid; payment refunded"
-                                        : "Critical error: invalid bounty amount and refund failed",
-                                    amountToDeduct, 0.0));
-                        }
-                        BountyEntry bounty = BountyEntry.create(targetUuid, targetName, bountyAmount, placerUuid, placerName, this.config.getBountyDurationDays());
-                        bounty = new BountyEntry(bounty.id(), bounty.targetUuid(), bounty.targetName(), bounty.totalAmount(), bounty.originalAmount(), taxResult.totalTax(), bounty.contractFeesDeducted(), bounty.placedByUuid(), bounty.placedByName(), bounty.placedTimestamp(), bounty.expireTimestamp(), bounty.status(), bounty.autonomous(), bounty.autonomousReason());
-                        return this.storage.insertBounty(bounty).thenCompose(id -> {
-                            if (id == null || id <= 0) {
-                                return SolidusBridge.addBalance(placer, amountToDeduct).thenApply(refundBalance -> {
-                                    if (refundBalance == null || refundBalance < 0.0) {
-                                        return new BountyResult(false, "Critical error: bounty save failed and refund failed", amountToDeduct, 0.0);
-                                    }
-                                    return new BountyResult(false, "Bounty save failed; payment refunded", amountToDeduct, 0.0);
-                                });
-                            }
-                            this.treasury.applyTax(taxResult);
-                            if (taxResult.treasuryAmount() > 0.0) {
-                                this.storage.addToTreasury(taxResult.treasuryAmount(), "tax");
-                            }
-                            if (taxResult.burnAmount() > 0.0) {
-                                this.storage.addToTreasury(taxResult.burnAmount(), "burn");
-                            }
-                            return CompletableFuture.completedFuture(new BountyResult(true, "Bounty of " + TextUtil.currency(bountyAmount).getString() + " placed on " + targetName + " (Tax: " + TextUtil.currency(taxResult.totalTax()).getString() + ")", amountToDeduct, bountyAmount));
-                        });
-                    });
-                });
+                return this.chargeAndCreate(placer, placerUuid, placerName, targetUuid, targetName, amount);
             });
         });
     }
 
-    public CompletableFuture<BountyResult> adminCancelBounty(int bountyId) {
-        return this.storage.getActiveBounties().thenComposeAsync(bounties -> {
-            BountyEntry target = null;
-            for (BountyEntry b : bounties) {
-                if (b.id() != bountyId) continue;
-                target = b;
-                break;
+    private CompletableFuture<BountyResult> chargeAndCreate(ServerPlayer placer, UUID placerUuid,
+                                                            String placerName, UUID targetUuid,
+                                                            String targetName, double amount) {
+        return SolidusBridge.subtractBalance(placer, amount).thenCompose(paid -> {
+            if (paid == null || !Double.isFinite(paid) || paid < 0.0) {
+                return CompletableFuture.completedFuture(BountyResult.fail(
+                        "Insufficient balance — you need " + TextUtil.currency(amount).getString()));
             }
-            if (target == null) {
-                return CompletableFuture.completedFuture(new BountyResult(false, "Bounty #" + bountyId + " not found or already resolved", 0.0, 0.0));
+
+            EconomyMath.TaxSplit tax = this.config.isBloodTaxEnabled()
+                    ? EconomyMath.bloodTax(amount, this.config.getBloodTaxRate(),
+                            this.config.getTreasuryShare(), this.config.getBurnShare())
+                    : new EconomyMath.TaxSplit(0.0, 0.0, 0.0, EconomyMath.round2(amount));
+            double bountyAmount = tax.remainingBounty();
+            if (bountyAmount <= 0.0) {
+                return this.refundAndFail(placer, amount, "Tax consumed the entire bounty; payment refunded");
             }
-            double confiscatedAmount = target.totalAmount();
-            this.treasury.loadFromStorage(this.treasury.getBalance() + confiscatedAmount, this.treasury.getTotalCollectedTax(), this.treasury.getTotalBurned(), this.treasury.getTotalPaidBounties());
-            this.storage.addToTreasury(confiscatedAmount, "tax");
-            return this.storage.updateBountyStatus(bountyId, BountyStatus.CANCELLED).thenApply(v -> new BountyResult(true, "Bounty #" + bountyId + " cancelled. " + TextUtil.currency(confiscatedAmount).getString() + " moved to treasury (no refund issued)", 0.0, confiscatedAmount));
+
+            BountyEntry bounty = BountyEntry.create(targetUuid, targetName, bountyAmount,
+                    placerUuid, placerName, this.config.getBountyDurationDays())
+                    .withTax(bountyAmount, tax.totalTax());
+
+            return this.storage.insertBounty(bounty).thenCompose(id -> {
+                if (id == null || id <= 0) {
+                    LOGGER.error("Bounty insert failed after payment — refunding {} ({})", placerName, amount);
+                    return this.refundAndFail(placer, amount, "Bounty could not be recorded; payment refunded");
+                }
+                bounty = bounty.withId(id);
+                return this.recordTaxMoves(tax, "bounty #" + id + " on " + targetName).thenApply(v ->
+                        new BountyResult(true,
+                                "Bounty of " + TextUtil.currency(bountyAmount).getString() + " placed on "
+                                        + TextUtil.target(targetName).getString()
+                                        + (tax.totalTax() > 0.0
+                                                ? " (blood tax: " + TextUtil.currency(tax.totalTax()).getString() + ")"
+                                                : ""),
+                                amount, bountyAmount, bounty));
+            });
         });
     }
+
+    private CompletableFuture<BountyResult> refundAndFail(ServerPlayer placer, double amount, String message) {
+        return SolidusBridge.addBalance(placer, amount).handle((refund, error) -> {
+            if (error != null || refund == null || refund < 0.0) {
+                LOGGER.error("REFUND FAILED for {} ({} S$) — manual intervention required", placer.getName().getString(), amount);
+                return BountyResult.fail(message + " — CRITICAL: refund failed, contact an admin");
+            }
+            return BountyResult.fail(message);
+        });
+    }
+
+    private CompletableFuture<Void> recordTaxMoves(EconomyMath.TaxSplit tax, String note) {
+        CompletableFuture<TreasuryManager.TreasurySnapshot> treasuryMove =
+                tax.treasuryAmount() > 0.0
+                        ? this.storage.adjustTreasury(TreasuryManager.Category.TAX, tax.treasuryAmount(), note)
+                        : CompletableFuture.completedFuture(this.treasury.snapshot());
+        CompletableFuture<TreasuryManager.TreasurySnapshot> burnMove =
+                tax.burnAmount() > 0.0
+                        ? this.storage.adjustTreasury(TreasuryManager.Category.BURN, tax.burnAmount(), note)
+                        : CompletableFuture.completedFuture(this.treasury.snapshot());
+        return CompletableFuture.allOf(treasuryMove, burnMove)
+                .thenRun(() -> {
+                    treasuryMove.thenAccept(this.treasury::applySnapshot);
+                    burnMove.thenAccept(this.treasury::applySnapshot);
+                });
+    }
+
+    // ------------------------------------------------------------------
+    // Decay + expiry + admin
+    // ------------------------------------------------------------------
 
     public CompletableFuture<Integer> processContractFees() {
         if (!this.config.isContractFeesEnabled()) {
             return CompletableFuture.completedFuture(0);
         }
-        return this.storage.getActiveBounties().thenComposeAsync(bounties -> {
+        return this.storage.getActiveBounties().thenCompose(bounties -> {
             int processed = 0;
-            long gracePeriodMs = (long)this.config.getContractGracePeriodHours() * 60L * 60L * 1000L;
+            CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
+            long graceMs = this.config.getContractGracePeriodMs();
             for (BountyEntry bounty : bounties) {
-                TreasuryManager.ContractFeeResult feeResult;
-                if (System.currentTimeMillis() - bounty.placedTimestamp() < gracePeriodMs || bounty.autonomous() || !((feeResult = this.treasury.processContractFee(bounty.totalAmount())).feeDeducted() > 0.0)) continue;
-                this.storage.updateBountyAmount(bounty.id(), feeResult.newAmount(), feeResult.feeDeducted());
-                ++processed;
+                if (bounty.autonomous()
+                        || System.currentTimeMillis() - bounty.placedTimestamp() < graceMs) {
+                    continue;
+                }
+                EconomyMath.FeeSplit fee = EconomyMath.contractFee(bounty.totalAmount(),
+                        this.config.getContractDailyRate(), this.config.getContractMinimumBounty());
+                if (fee.fee() <= 0.0) {
+                    continue;
+                }
+                processed++;
+                tail = tail.thenCompose(v -> this.storage.updateBountyAmount(bounty.id(), fee.newAmount(), fee.fee())
+                        .thenCompose(ignored -> this.storage.adjustTreasury(
+                                TreasuryManager.Category.FEE, fee.fee(), "bounty #" + bounty.id()))
+                        .thenAccept(this.treasury::applySnapshot));
             }
             int count = processed;
-            return CompletableFuture.completedFuture(count);
+            return tail.thenApply(ignored -> count);
         });
     }
 
+    /**
+     * Expires overdue player bounties and refunds each placer through the
+     * offline bridge. Refund results are checked: a failed refund is logged
+     * with the bounty id for manual recovery instead of vanishing silently.
+     */
     public CompletableFuture<Integer> processExpirations() {
-        return this.storage.getActiveBounties().thenComposeAsync(bounties -> {
-            int expired = 0;
-            for (BountyEntry bounty : bounties) {
-                if (!bounty.isExpired()) continue;
-                if (SolidusBridge.isAvailable() && bounty.placedByUuid() != null && !bounty.autonomous()) {
-                    SolidusBridge.addBalanceOffline(bounty.placedByUuid(), bounty.placedByName(), bounty.totalAmount());
+        return this.storage.expireOldBounties().thenCompose(expired -> {
+            CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
+            for (BountyEntry bounty : expired) {
+                if (bounty.placedByUuid() == null) {
+                    continue;
                 }
-                this.storage.updateBountyStatus(bounty.id(), BountyStatus.EXPIRED);
-                ++expired;
+                tail = tail.thenCompose(v -> SolidusBridge.addBalanceOffline(
+                                bounty.placedByUuid(), bounty.placedByName(), bounty.totalAmount())
+                        .thenAccept(balance -> {
+                            if (balance == null || balance < 0.0) {
+                                LOGGER.error("Expiry refund FAILED for bounty #{} ({} to {}) — manual recovery needed",
+                                        bounty.id(), bounty.totalAmount(), bounty.placedByName());
+                            } else {
+                                LOGGER.info("Expiry refund paid: bounty #{} -> {} ({})", bounty.id(),
+                                        bounty.placedByName(), bounty.totalAmount());
+                            }
+                        }));
             }
-            int count = expired;
-            return CompletableFuture.completedFuture(count);
+            return tail.thenApply(ignored -> expired.size());
+        });
+    }
+
+    /** Admin cancellation: funds are confiscated to the treasury, never refunded. */
+    public CompletableFuture<BountyResult> adminCancelBounty(int bountyId, String adminName) {
+        return this.storage.getActiveBounties().thenCompose(bounties -> {
+            BountyEntry target = bounties.stream().filter(b -> b.id() == bountyId).findFirst().orElse(null);
+            if (target == null) {
+                return CompletableFuture.completedFuture(BountyResult.fail(
+                        "Bounty #" + bountyId + " not found or already resolved"));
+            }
+            return this.storage.updateBountyStatus(bountyId, BountyStatus.CANCELLED)
+                    .thenCompose(v -> this.storage.adjustTreasury(TreasuryManager.Category.CONFISCATION,
+                            target.totalAmount(), "bounty #" + bountyId + " cancelled by " + adminName))
+                    .thenApply(this.treasury::applySnapshot)
+                    .thenApply(v -> new BountyResult(true,
+                            "Bounty #" + bountyId + " cancelled; "
+                                    + TextUtil.currency(target.totalAmount()).getString()
+                                    + " confiscated to treasury (no refund)", 0.0, target.totalAmount(), target));
         });
     }
 
@@ -171,6 +239,15 @@ public final class BountyManager {
         return this.storage.getTotalBountyForTarget(targetUuid);
     }
 
-    public record BountyResult(boolean success, String message, double amountPaid, double bountyAmount) {
+    public record BountyResult(boolean success, String message, double amountPaid,
+                               double bountyAmount, BountyEntry bounty) {
+        public static BountyResult fail(String message) {
+            return new BountyResult(false, message, 0.0, 0.0, null);
+        }
+
+        /** Compatibility for simple results without a bounty payload. */
+        public BountyResult(boolean success, String message, double amountPaid, double bountyAmount) {
+            this(success, message, amountPaid, bountyAmount, null);
+        }
     }
 }
