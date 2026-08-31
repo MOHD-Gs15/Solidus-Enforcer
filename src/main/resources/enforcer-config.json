@@ -4,6 +4,9 @@
     "silver": { "weekly_cost": 700.0 },
     "gold": { "weekly_cost": 1200.0 }
   },
+  "license": {
+    "duration_days": 7
+  },
   "bounty_limits": {
     "min_bounty": 500.0,
     "max_bounty": 1000000.0,
@@ -38,6 +41,7 @@
     "wealth_monopoly_threshold": 0.40,
     "kill_streak_threshold": 10,
     "kd_ratio_threshold": 4.0,
+    "min_kills_for_kd_check": 10,
     "min_auto_bounty": 1000.0,
     "max_auto_bounty": 50000.0,
     "check_interval_minutes": 30,
@@ -46,6 +50,9 @@
   },
   "collusion_detection": {
     "enabled": true,
+    "kill_pair_window_minutes": 60,
+    "max_same_pair_kills": 3,
+    "max_mutual_swaps": 2,
     "transaction_lookback_days": 30,
     "max_mutual_transactions": 5,
     "same_claim_penalty": true
@@ -53,6 +60,7 @@
   "compass": {
     "update_interval_ticks": 1200,
     "silver_accuracy_blocks": 50,
-    "gold_accuracy_blocks": 5
+    "gold_accuracy_blocks": 5,
+    "track_cooldown_minutes": 5
   }
 }

@@ -1,13 +1,17 @@
 {
-  "required": false,
+  "required": true,
   "minVersion": "0.8",
   "package": "com.solidus.enforcer.mixin",
   "compatibilityLevel": "JAVA_25",
   "mixins": [
     "ServerPlayerDamageMixin",
-    "ServerPlayerEntityMixin"
+    "ServerPlayerDeathMixin"
   ],
   "injectors": {
-    "defaultRequire": 0
-  }
+    "defaultRequire": 1
+  },
+  "server": [
+    "ServerPlayerDamageMixin",
+    "ServerPlayerDeathMixin"
+  ]
 }
