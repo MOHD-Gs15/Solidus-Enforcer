@@ -1,5 +1,6 @@
 # Solidus Enforcer — Bounty & Enforcement Layer
 
+[![Solidus Family](https://img.shields.io/badge/Solidus_Family-2.1.0-8B5CF6.svg)](VERSIONING.md)
 [![Platform](https://img.shields.io/badge/Platform-Fabric-blue.svg)](https://fabricmc.net/)
 [![Minecraft](https://img.shields.io/badge/Minecraft-26.1.2-green.svg)](https://www.minecraft.net/)
 [![Java](https://img.shields.io/badge/Java-25-orange.svg)](https://adoptium.net/)
@@ -7,7 +8,7 @@
 
 **Bounty hunting, hunter licenses, alliance payouts, anti-exploit enforcement and collusion detection for the Solidus economy ecosystem — 100% server-side.**
 
-*Rebuilt v1.1: this codebase was reconstructed from a decompiled artifact and then re-audited end to end. Every money path is now atomic, the tick thread never blocks, and every advertised feature actually exists. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).*
+*Rebuilt v1.1, aligned to the 2.1.0 family: this codebase was reconstructed from a decompiled artifact and then re-audited end to end. Every money path is now atomic, the tick thread never blocks, and every advertised feature actually exists — proven by CI on every push. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [VERSIONING.md](VERSIONING.md).*
 
 ---
 
