@@ -49,7 +49,7 @@ public final class CollusionDetector {
         CompletableFuture<Integer> mutualSwaps = this.storage.countMutualSwaps(killerUuid, victimUuid, windowMs);
         CompletableFuture<Integer> mutualTransfers = this.fetchMutualTransfers(killerUuid, victimUuid);
 
-        return pairKills.thenCombine(mutualSwaps, Decision::new)
+        return pairKills.thenCombine(mutualSwaps, (kills, swaps) -> new Decision(kills, swaps, 0))
                 .thenCombine(mutualTransfers, (d, transfers) -> new Decision(d.pairKills, d.mutualSwaps, transfers))
                 .thenApply(decision -> {
                     Decision.Policy policy = decision.evaluate(

@@ -15,13 +15,17 @@ public final class EconomyMath {
      * Splits a bounty payment into the blood tax (treasury + burn shares) and
      * the amount the hunter will actually fight over.
      *
+     * <p>Garbage amounts (NaN / non-positive) pass through untouched with a zero
+     * tax — this function never launders a bad amount into a valid-looking zero;
+     * callers validate and reject.
+     *
      * Shares are normalised when treasuryShare + burnShare exceeds 1.0.
      */
     public static TaxSplit bloodTax(double bountyAmount, double taxRate,
                                     double treasuryShareRate, double burnShareRate) {
         if (!Double.isFinite(bountyAmount) || bountyAmount <= 0.0
                 || !Double.isFinite(taxRate) || taxRate <= 0.0) {
-            return new TaxSplit(0.0, 0.0, 0.0, sanitize(bountyAmount));
+            return new TaxSplit(0.0, 0.0, 0.0, bountyAmount);
         }
         taxRate = clamp(taxRate, 0.0, 1.0);
         treasuryShareRate = clamp(treasuryShareRate, 0.0, 1.0);

@@ -1,6 +1,7 @@
 package com.solidus.enforcer;
 
 import com.mojang.brigadier.CommandDispatcher;
+import com.mojang.brigadier.context.CommandContext;
 import com.solidus.enforcer.bounty.AutonomousBountyEngine;
 import com.solidus.enforcer.bounty.BountyAnnouncer;
 import com.solidus.enforcer.bounty.BountyManager;
@@ -17,6 +18,7 @@ import com.solidus.enforcer.security.AntiExploitEngine;
 import com.solidus.enforcer.security.CollusionDetector;
 import com.solidus.enforcer.storage.EnforcerStorage;
 import com.solidus.enforcer.util.ConfigManager;
+import com.solidus.enforcer.util.TextUtil;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 import net.fabricmc.api.DedicatedServerModInitializer;

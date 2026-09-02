@@ -5,6 +5,7 @@ import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.solidus.enforcer.SolidusEnforcerMod;
 import com.solidus.enforcer.bounty.BountyEntry;
 import com.solidus.enforcer.bounty.BountyManager;
@@ -57,7 +58,7 @@ public final class BountyCommand {
         dispatcher.register(bounty);
     }
 
-    private static int executePlace(CommandContext<CommandSourceStack> ctx, SolidusEnforcerMod mod) throws Exception {
+    private static int executePlace(CommandContext<CommandSourceStack> ctx, SolidusEnforcerMod mod) throws CommandSyntaxException {
         ServerPlayer placer = ctx.getSource().getPlayerOrException();
         ServerPlayer target = EntityArgument.getPlayer(ctx, "target");
         double amount = DoubleArgumentType.getDouble(ctx, "amount");
@@ -71,7 +72,7 @@ public final class BountyCommand {
 
         licenseManager.hasActiveLicense(placer.getUUID()).thenAccept(licensed -> {
             if (!licensed) {
-                ctx.getSource().sendFailure(() -> TextUtil.branded(
+                ctx.getSource().sendFailure(TextUtil.branded(
                         "You need a Hunter License to place bounties — /hunter tiers", TextUtil.COLOR_BAD));
                 return;
             }
