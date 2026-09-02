@@ -4,7 +4,7 @@
   "version": "${version}",
   "name": "Solidus Enforcer",
   "description": "Server-side bounty, hunter licensing, anti-exploit, and combat enforcement for Solidus.",
-  "authors": ["MOHD_Gs"],
+  "authors": ["MOHD-Gs15"],
   "contact": {
     "sources": "https://github.com/MOHD-Gs15/Solidus-Enforcer"
   },

@@ -70,4 +70,4 @@ worker) and is fully independent of Core's databases.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Part of the [Solidus Economy Ecosystem](https://github.com/mohd-gs).
+MIT — see [LICENSE](LICENSE). Part of the [Solidus Economy Ecosystem](https://github.com/MOHD-Gs15).
