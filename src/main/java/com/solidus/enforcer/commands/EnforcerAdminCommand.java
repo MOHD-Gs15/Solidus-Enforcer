@@ -2,6 +2,7 @@ package com.solidus.enforcer.commands;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.context.CommandContext;
 import com.solidus.enforcer.SolidusEnforcerMod;
 import com.solidus.enforcer.bounty.BountyEntry;
 import com.solidus.enforcer.util.TextUtil;
@@ -61,11 +62,11 @@ public final class EnforcerAdminCommand {
                             .append(Component.literal("Treasury Ledger (last " + entries.size() + ")")
                                     .withColor(TextUtil.COLOR_HEADER));
                     if (entries.isEmpty()) {
-                        msg = msg.append(Component.literal("\n  (no movements recorded yet)")
+                        msg.append(Component.literal("\n  (no movements recorded yet)")
                                 .withColor(TextUtil.COLOR_MUTED));
                     }
                     for (String entry : entries) {
-                        msg = msg.append(Component.literal("\n  " + entry).withColor(TextUtil.COLOR_INFO));
+                        msg.append(Component.literal("\n  " + entry).withColor(TextUtil.COLOR_INFO));
                     }
                     ctx.getSource().sendSuccess(() -> msg, false);
                 }));
@@ -82,7 +83,7 @@ public final class EnforcerAdminCommand {
                             .append(Component.literal("Active Bounties (" + bounties.size() + ")")
                                     .withColor(TextUtil.COLOR_HEADER));
                     for (BountyEntry b : bounties) {
-                        msg = msg.append(Component.literal("\n  #" + b.id() + "  ").withColor(TextUtil.COLOR_MUTED))
+                        msg.append(Component.literal("\n  #" + b.id() + "  ").withColor(TextUtil.COLOR_MUTED))
                                 .append(TextUtil.target(b.targetName()))
                                 .append(Component.literal("  ").withColor(TextUtil.COLOR_MUTED))
                                 .append(TextUtil.currency(b.totalAmount()))
@@ -91,9 +92,9 @@ public final class EnforcerAdminCommand {
                                         .withColor(TextUtil.COLOR_INFO));
                     }
                     if (bounties.isEmpty()) {
-                        msg = msg.append(Component.literal("\n  (none)").withColor(TextUtil.COLOR_MUTED));
+                        msg.append(Component.literal("\n  (none)").withColor(TextUtil.COLOR_MUTED));
                     }
-                    msg = msg.append(Component.literal("\n  Cancel with /enforcer cancel <id>")
+                    msg.append(Component.literal("\n  Cancel with /enforcer cancel <id>")
                             .withColor(TextUtil.COLOR_MUTED));
                     ctx.getSource().sendSuccess(() -> msg, false);
                 }));
@@ -126,12 +127,12 @@ public final class EnforcerAdminCommand {
                     MutableComponent msg = TextUtil.prefix()
                             .append(Component.literal("Top Hunters (by streak)").withColor(TextUtil.COLOR_HEADER));
                     if (killers.isEmpty()) {
-                        msg = msg.append(Component.literal("\n  (no kills recorded yet)")
+                        msg.append(Component.literal("\n  (no kills recorded yet)")
                                 .withColor(TextUtil.COLOR_MUTED));
                     }
                     int rank = 1;
                     for (var k : killers) {
-                        msg = msg.append(Component.literal("\n  " + rank + ". ").withColor(TextUtil.COLOR_MUTED))
+                        msg.append(Component.literal("\n  " + rank + ". ").withColor(TextUtil.COLOR_MUTED))
                                 .append(TextUtil.player(k.name()))
                                 .append(Component.literal(String.format(
                                         "  — %d kills, %d deaths, streak %d",

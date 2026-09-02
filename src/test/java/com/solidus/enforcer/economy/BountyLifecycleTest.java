@@ -46,7 +46,8 @@ class BountyLifecycleTest {
                 UUID.randomUUID(), "Alex", 7);
         BountyEntry decayed = bounty.withDeductedAmount(891.0, 9.0).withDeductedAmount(882.09, 8.91);
 
-        assertEquals(900.0, bounty.contractFeesDeducted());
+        // The wither chain must stay non-destructive: the placement-time amount survives.
+        assertEquals(900.0, decayed.originalAmount());
         assertEquals(17.91, decayed.contractFeesDeducted(), 1e-9);
         assertEquals(882.09, decayed.totalAmount(), 1e-9);
     }

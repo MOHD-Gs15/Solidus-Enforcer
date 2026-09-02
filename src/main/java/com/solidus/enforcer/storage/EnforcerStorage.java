@@ -623,7 +623,7 @@ public final class EnforcerStorage {
                         return Optional.of(new LicenseData(
                                 UUID.fromString(rs.getString("player_uuid")),
                                 rs.getString("player_name"),
-                                LicenseTier.fromString(rs.getString("tier")),
+                                LicenseTier.parse(rs.getString("tier")),
                                 rs.getLong("purchase_timestamp"),
                                 rs.getLong("expire_timestamp"),
                                 rs.getInt("active") == 1));

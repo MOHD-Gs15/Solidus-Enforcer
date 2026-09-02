@@ -98,7 +98,7 @@ public final class KillProcessor {
         });
     }
 
-    private CompletableFuture<Void> settlePayout(List<BountyEntry> claimed, ServerPlayer victim,
+    private CompletableFuture<Boolean> settlePayout(List<BountyEntry> claimed, ServerPlayer victim,
                                                  ServerPlayer killer, Map<UUID, Double> contributions,
                                                  double payable, AntiExploitEngine.ExploitCheckResult exploitResult,
                                                  double totalBounty, MinecraftServer server) {
@@ -128,7 +128,7 @@ public final class KillProcessor {
                         }
                         return this.storage.recordKill(killer.getUUID(), killer.getName().getString(),
                                         victim.getUUID(), victim.getName().getString())
-                                .thenCompose(v -> this.damageTracker.clearRecords(victim.getUUID()))
+                                .thenRun(() -> this.damageTracker.clearRecords(victim.getUUID()))
                                 .thenRun(() -> server.execute(() -> BountyAnnouncer.announceClaim(
                                         claimed, victim, killer, totalBounty, payable, exploitResult, server,
                                         payouts)))

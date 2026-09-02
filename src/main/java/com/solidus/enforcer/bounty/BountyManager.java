@@ -108,7 +108,7 @@ public final class BountyManager {
                     LOGGER.error("Bounty insert failed after payment — refunding {} ({})", placerName, amount);
                     return this.refundAndFail(placer, amount, "Bounty could not be recorded; payment refunded");
                 }
-                bounty = bounty.withId(id);
+                BountyEntry storedBounty = bounty.withId(id);
                 return this.recordTaxMoves(tax, "bounty #" + id + " on " + targetName).thenApply(v ->
                         new BountyResult(true,
                                 "Bounty of " + TextUtil.currency(bountyAmount).getString() + " placed on "
@@ -116,7 +116,7 @@ public final class BountyManager {
                                         + (tax.totalTax() > 0.0
                                                 ? " (blood tax: " + TextUtil.currency(tax.totalTax()).getString() + ")"
                                                 : ""),
-                                amount, bountyAmount, bounty));
+                                amount, bountyAmount, storedBounty));
             });
         });
     }
@@ -219,7 +219,7 @@ public final class BountyManager {
             return this.storage.updateBountyStatus(bountyId, BountyStatus.CANCELLED)
                     .thenCompose(v -> this.storage.adjustTreasury(TreasuryManager.Category.CONFISCATION,
                             target.totalAmount(), "bounty #" + bountyId + " cancelled by " + adminName))
-                    .thenApply(this.treasury::applySnapshot)
+                    .thenAccept(this.treasury::applySnapshot)
                     .thenApply(v -> new BountyResult(true,
                             "Bounty #" + bountyId + " cancelled; "
                                     + TextUtil.currency(target.totalAmount()).getString()

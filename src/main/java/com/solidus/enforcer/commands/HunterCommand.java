@@ -3,6 +3,7 @@ package com.solidus.enforcer.commands;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.context.CommandContext;
+import com.mojang.brigadier.exceptions.CommandSyntaxException;
 import com.mojang.brigadier.suggestion.SuggestionProvider;
 import com.solidus.enforcer.SolidusEnforcerMod;
 import com.solidus.enforcer.license.HunterLicenseManager;
@@ -84,14 +85,13 @@ public final class HunterCommand {
                 .append(Component.literal("\n")).append(TextUtil.separator());
         for (LicenseTier tier : LicenseTier.values()) {
             double cost = config.getLicenseWeeklyCost(tier.name());
-            tiers = tiers
-                    .append(Component.literal("\n  " + tier.name() + " ").withColor(TextUtil.COLOR_BRAND))
+            tiers.append(Component.literal("\n  " + tier.name() + " ").withColor(TextUtil.COLOR_BRAND))
                     .append(TextUtil.currency(cost))
                     .append(Component.literal(" / " + config.getLicenseDurationDays() + " days")
                             .withColor(TextUtil.COLOR_MUTED))
                     .append(Component.literal("\n    " + tier.perksLine()).withColor(TextUtil.COLOR_INFO));
         }
-        tiers = tiers.append(Component.literal("\n")).append(TextUtil.separator());
+        tiers.append(Component.literal("\n")).append(TextUtil.separator());
         ctx.getSource().sendSuccess(() -> tiers, false);
         return 1;
     }
@@ -111,7 +111,7 @@ public final class HunterCommand {
             return 0;
         }
         if (tier == null) {
-            ctx.getSource().sendFailure(() -> TextUtil.branded(
+            ctx.getSource().sendFailure(TextUtil.branded(
                     "Unknown tier \"" + tierName + "\" — valid tiers: bronze, silver, gold", TextUtil.COLOR_BAD));
             return 0;
         }
@@ -169,7 +169,7 @@ public final class HunterCommand {
 
     private static final Map<UUID, Long> TRACK_COOLDOWNS = new ConcurrentHashMap<>();
 
-    private static int executeTrack(CommandContext<CommandSourceStack> ctx, SolidusEnforcerMod mod) throws Exception {
+    private static int executeTrack(CommandContext<CommandSourceStack> ctx, SolidusEnforcerMod mod) throws CommandSyntaxException {
         ServerPlayer hunter = ctx.getSource().getPlayerOrException();
         ServerPlayer target = EntityArgument.getPlayer(ctx, "target");
         HunterLicenseManager manager = mod.getLicenseManager();
@@ -197,7 +197,7 @@ public final class HunterCommand {
             Long lastTrack = TRACK_COOLDOWNS.get(hunterUuid);
             if (lastTrack != null && now - lastTrack < cooldownMs) {
                 long remaining = cooldownMs - (now - lastTrack);
-                ctx.getSource().sendFailure(() -> TextUtil.branded(
+                ctx.getSource().sendFailure(TextUtil.branded(
                         "Tracking on cooldown — available in " + TextUtil.formatDuration(remaining),
                         TextUtil.COLOR_WARN));
                 return;
