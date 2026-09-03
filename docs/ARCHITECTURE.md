@@ -1,6 +1,6 @@
 # Solidus Enforcer — Architecture
 
-> **Version**: 2.1.0 | **Minecraft**: 26.1.2 | **Fabric**: 0.19.4+ | **Java**: 25
+> **Version**: 2.1.1 | **Minecraft**: 26.1.2 | **Fabric**: 0.19.4+ | **Java**: 25
 > **License**: MIT | **Environment**: 100% Server-Side Only
 
 ---
@@ -18,7 +18,8 @@
 9. [Storage Schema](#9-storage-schema)
 10. [Thread Model](#10-thread-model)
 11. [Integration With Solidus Core](#11-integration-with-solidus-core)
-12. [Defects Fixed In v1.1](#12-defects-fixed-in-v11)
+12. [Defects Fixed In 2.1.1](#12-defects-fixed-in-211-security-audit-round-1)
+13. [Defects Fixed In v1.1](#13-defects-fixed-in-v11)
 
 ---
 
@@ -71,13 +72,16 @@ sink, contract decay) to every placement.
 |---|---|
 | Placing a bounty | One atomic `subtractBalance` (Core-side check+deduct). No pre-check → no TOCTOU. |
 | Insert failure after payment | Automatic `addBalance` refund; failed refunds log CRITICAL. |
-| Blood tax | Split via `EconomyMath.bloodTax`; 100% tax rates refuse to zero out bounties. |
-| Contract fees | Computed + bounty row updated + treasury ledgered **together** (the old build lost fees on restart). |
+| Blood tax | Split via `EconomyMath.bloodTax`; 100% tax rates refuse to zero out bounties. Treasury leg and burn leg are recorded in one DB transaction each; a failure rolls the whole placement back (bounty cancelled while still unclaimed + placer refunded). |
+| Burn leg | Raises `total_burned` only — the burn share **never becomes spendable treasury balance** (it left the economy at placement). |
+| Contract fees | Computed + bounty row updated + treasury ledgered **in one transaction** (`applyContractFee`) — a failure changes nothing. |
 | Claim | `claimBountiesForTarget` selects and marks CLAIMED in one task — double kills cannot double-claim. |
-| Payout failure | `revertClaim` puts bounties back to ACTIVE (compensation transaction). |
-| Expiry | Expired rows are returned by `expireOldBounties`, refunded through the offline bridge, and refunds are verified. |
-| Autonomous funding | `tryFundAutonomousBounty` reads balance and deducts in one task; insert failure rolls funding back. |
-| Every treasury movement | Appended to `treasury_ledger` with category + note. |
+| Total payout failure | `revertClaim` puts bounties back to ACTIVE (compensation transaction). |
+| Partial payout failure | Bounties stay CLAIMED (never re-payable) + CRITICAL log — reverting partially paid bounties would duplicate money. |
+| Confiscation (admin / collusion) | `confiscateBounties`: status CAS + ledger + treasury credit in one transaction — races and double-cancels change nothing. |
+| Expiry | Rows are marked EXPIRED + `refund_pending`; each refund is claimed in the DB before the money is attempted, so a crash only postpones un-attempted refunds (retried every cycle and at startup). |
+| Autonomous funding | `tryFundAutonomousBounty` reads balance and deducts in one task + one transaction; insert failure rolls funding back through AUTO_REFUND (balance restored, paid stat rolled back). |
+| Every treasury movement | Ledger row + treasury row applied in ONE transaction, appended to `treasury_ledger` with category + note; failures complete exceptionally (fail-loud) so callers compensate. |
 
 ## 4. The Bounty Lifecycle
 
@@ -202,7 +206,25 @@ Reflection bridge, zero compile dependency:
 * absent Core ⇒ `isAvailable() == false` ⇒ every economy path refuses with
   a clear message.
 
-## 12. Defects Fixed In v1.1
+## 12. Defects Fixed In 2.1.1 (Security Audit Round 1)
+
+| # | Defect (2.1.0) | Fix (2.1.1) |
+|---|---|---|
+| 1 | Any payment failure reverted the whole claim — even after some recipients were already paid, re-arming the bounties for a re-pay (money duplication) | Revert only when NOTHING was paid; partial failures keep bounties CLAIMED + CRITICAL log |
+| 2 | BURN credited the treasury balance (the "burn sink" was spendable) and AUTO_REFUND deducted instead of refunding (rollback double-loss) | Burn raises the stat only; AUTO_REFUND restores balance and rolls the paid stat back; all treasury movements are single-transaction and fail-loud |
+| 3 | License DB-write failure was swallowed → player charged, purchase reported SUCCESS, refund path dead code | `saveLicense` reports real success; failure triggers a verified refund |
+| 4 | Unconditional status transitions: concurrent admin cancels double-credited the treasury; a cancel racing a claim could confiscate AND pay out | `confiscateBounties` atomic CAS transaction |
+| 5 | Money-loop collusion signal counted directions (max 2), never fired | Counts matching transaction rows in both directions |
+| 6 | Contract-fee two-leg writes were separate, non-atomic and silent | `applyContractFee` single-task single-transaction |
+| 7 | Crash during expiry refunds stranded the money forever (row already EXPIRED, refund never retried) | `refund_pending` claim-before-pay recovery loop |
+| 8 | GOLD live tracking never re-checked the bounty or the license | Per-refresh revalidation of both, stops with a notice |
+| 9 | `/bounty top` served unlicensed players | License gate like the rest of the board |
+| 10 | `/bounty place` delivery + announcement ran on Core/storage threads | Server-thread hop |
+| 11 | Storage task submission after shutdown threw into the death mixin | Guarded `run()`/`supply()` wrappers |
+| 12 | `enforcer.db` world-readable (0644) | 0600 on initialisation |
+| 13 | Buying a license while active discarded the remaining days | Renewal extends from the current expiry |
+
+## 13. Defects Fixed In v1.1
 
 | # | Defect (v1.0) | Fix (v1.1) |
 |---|---|---|

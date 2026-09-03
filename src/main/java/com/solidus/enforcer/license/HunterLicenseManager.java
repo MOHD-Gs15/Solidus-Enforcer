@@ -43,25 +43,49 @@ public final class HunterLicenseManager {
         UUID uuid = player.getUUID();
         String name = player.getName().getString();
         long now = System.currentTimeMillis();
-        LicenseData license = new LicenseData(uuid, name, tier, now,
-                now + java.util.concurrent.TimeUnit.DAYS.toMillis(this.config.getLicenseDurationDays()), true);
-        return SolidusBridge.subtractBalance(player, cost).thenCompose(newBalance -> {
-            if (newBalance == null || !Double.isFinite(newBalance) || newBalance < 0.0) {
-                return CompletableFuture.completedFuture(new PurchaseResult(false,
-                        "Payment failed — you need " + String.format("%.2f S$", cost), null));
-            }
-            return this.storage.saveLicense(license).thenCompose(ignored -> {
-                PurchaseResult success = new PurchaseResult(true,
-                        tier.displayName() + "\u00A7r Hunter License active for "
-                                + this.config.getLicenseDurationDays() + " days (" + String.format("%.2f S$", cost) + ")",
-                        license);
-                return CompletableFuture.completedFuture(success);
-            }).exceptionally(error -> {
-                LOGGER.error("License save failed after payment — attempting refund for {}", name, error);
-                SolidusBridge.addBalance(player, cost);
-                return new PurchaseResult(false, "License activation failed; payment refunded", null);
+        long durationMs = java.util.concurrent.TimeUnit.DAYS.toMillis(this.config.getLicenseDurationDays());
+        // Renewal extends the current window instead of restarting it — the
+        // remaining days of a still-active license are never silently discarded.
+        return this.storage.getLicense(uuid).thenCompose(existing -> {
+            long expiry = computeExpiry(now,
+                    existing.filter(LicenseData::isValid).map(LicenseData::expireTimestamp).orElse(null), durationMs);
+            LicenseData license = new LicenseData(uuid, name, tier, now, expiry, true);
+            return SolidusBridge.subtractBalance(player, cost).thenCompose(newBalance -> {
+                if (newBalance == null || !Double.isFinite(newBalance) || newBalance < 0.0) {
+                    return CompletableFuture.completedFuture(new PurchaseResult(false,
+                            "Payment failed — you need " + String.format("%.2f S$", cost), null));
+                }
+                // saveLicense completes with false on a failed write (it never fails
+                // silently) — the refund below is therefore a REAL path, not dead code.
+                return this.storage.saveLicense(license).thenCompose(saved -> {
+                    if (saved) {
+                        return CompletableFuture.completedFuture(new PurchaseResult(true,
+                                tier.displayName() + "\u00A7r Hunter License active for "
+                                        + this.config.getLicenseDurationDays() + " days ("
+                                        + String.format("%.2f S$", cost) + ")",
+                                license));
+                    }
+                    LOGGER.error("License save failed after payment — attempting refund for {}", name);
+                    return SolidusBridge.addBalance(player, cost).handle((refund, refundError) -> {
+                        if (refundError != null || refund == null || refund < 0.0) {
+                            LOGGER.error("REFUND FAILED for {} ({}) — manual intervention required", name, cost);
+                            return new PurchaseResult(false,
+                                    "License activation failed — CRITICAL: refund failed, contact an admin", null);
+                        }
+                        return new PurchaseResult(false, "License activation failed; payment refunded", null);
+                    });
+                });
             });
         });
+    }
+
+    /**
+     * Renewal expiry math: a fresh purchase starts at {@code now}; a renewal
+     * extends from the current still-valid expiry so no paid time is lost.
+     */
+    static long computeExpiry(long now, Long currentValidExpiry, long durationMs) {
+        long base = currentValidExpiry != null && currentValidExpiry > now ? currentValidExpiry : now;
+        return base + Math.max(1L, durationMs);
     }
 
     public CompletableFuture<Void> deactivate(UUID playerUuid) {

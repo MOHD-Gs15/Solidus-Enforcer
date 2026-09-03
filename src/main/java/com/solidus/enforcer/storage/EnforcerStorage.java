@@ -7,11 +7,14 @@ import com.solidus.enforcer.license.LicenseData;
 import com.solidus.enforcer.license.LicenseTier;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Savepoint;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
@@ -50,7 +53,7 @@ public final class EnforcerStorage {
     }
 
     public CompletableFuture<Void> initialize() {
-        return CompletableFuture.runAsync(() -> {
+        return this.run(() -> {
             try {
                 Files.createDirectories(this.dbPath.getParent());
                 this.connection = DriverManager.getConnection("jdbc:sqlite:" + this.dbPath);
@@ -62,12 +65,18 @@ public final class EnforcerStorage {
                     stmt.execute("PRAGMA cache_size=2048");
                 }
                 this.createTables();
+                this.tightenDbFilePermissions();
                 LOGGER.info("Enforcer database initialized at {}", this.dbPath);
             } catch (Exception e) {
                 LOGGER.error("Failed to initialize Enforcer database", e);
                 throw new RuntimeException(e);
             }
-        }, this.executor);
+        });
+    }
+
+    /** Path of the SQLite file (test/diagnostic access). */
+    public Path dbPath() {
+        return this.dbPath;
     }
 
     public void shutdown() {
@@ -89,6 +98,19 @@ public final class EnforcerStorage {
             LOGGER.info("Enforcer database shut down");
         } catch (SQLException e) {
             LOGGER.error("Error closing Enforcer database", e);
+        }
+    }
+
+    /** The DB carries player economy intel — family policy is 0600. */
+    private void tightenDbFilePermissions() {
+        try {
+            java.nio.file.attribute.PosixFileAttributeView view =
+                    Files.getFileAttributeView(this.dbPath, java.nio.file.attribute.PosixFileAttributeView.class);
+            if (view != null) {
+                view.setPermissions(PosixFilePermissions.fromString("rw-------"));
+            }
+        } catch (Exception e) {
+            LOGGER.debug("Could not tighten enforcer.db permissions: {}", e.toString());
         }
     }
 
@@ -188,6 +210,9 @@ public final class EnforcerStorage {
 
             // damage_records gained attacker_name in v1.1; older databases lack it.
             this.addColumnIfMissing(stmt, "damage_records", "attacker_name", "TEXT NOT NULL DEFAULT 'Unknown'");
+            // 2.1.1: expiry refund recovery — rows are claimed before their refund is
+            // attempted so a crash can never strand a refund forever (E-7).
+            this.addColumnIfMissing(stmt, "bounties", "refund_pending", "INTEGER NOT NULL DEFAULT 0");
         }
     }
 
@@ -204,9 +229,26 @@ public final class EnforcerStorage {
     }
 
     private <T> CompletableFuture<T> supply(java.util.function.Supplier<T> task) {
-        return this.shutdown
-                ? CompletableFuture.failedFuture(new IllegalStateException("Enforcer storage is shut down"))
-                : CompletableFuture.supplyAsync(task, this.executor);
+        if (this.shutdown) {
+            return CompletableFuture.failedFuture(new IllegalStateException("Enforcer storage is shut down"));
+        }
+        try {
+            return CompletableFuture.supplyAsync(task, this.executor);
+        } catch (RuntimeException rejected) {
+            return CompletableFuture.failedFuture(rejected);
+        }
+    }
+
+    /** Guarded async runnable — never throws RejectedExecutionException into callers. */
+    private CompletableFuture<Void> run(Runnable task) {
+        if (this.shutdown) {
+            return CompletableFuture.failedFuture(new IllegalStateException("Enforcer storage is shut down"));
+        }
+        try {
+            return CompletableFuture.runAsync(task, this.executor);
+        } catch (RuntimeException rejected) {
+            return CompletableFuture.failedFuture(rejected);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -327,7 +369,7 @@ public final class EnforcerStorage {
 
     /** Compensation path: puts an already-claimed set back up for grabs. */
     public CompletableFuture<Void> revertClaim(List<Integer> bountyIds) {
-        return CompletableFuture.runAsync(() -> {
+        return this.run(() -> {
             if (bountyIds == null || bountyIds.isEmpty()) {
                 return;
             }
@@ -346,11 +388,11 @@ public final class EnforcerStorage {
             } catch (SQLException e) {
                 LOGGER.error("Failed to revert bounty claims {}", bountyIds, e);
             }
-        }, this.executor);
+        });
     }
 
     public CompletableFuture<Void> updateBountyStatus(int bountyId, BountyStatus status) {
-        return CompletableFuture.runAsync(() -> {
+        return this.run(() -> {
             try (PreparedStatement ps = this.connection.prepareStatement(
                     "UPDATE bounties SET status = ? WHERE id = ?")) {
                 ps.setInt(1, status.getCode());
@@ -359,24 +401,125 @@ public final class EnforcerStorage {
             } catch (SQLException e) {
                 LOGGER.error("Failed to update bounty status", e);
             }
-        }, this.executor);
+        });
     }
 
-    public CompletableFuture<Void> updateBountyAmount(int bountyId, double newAmount, double contractFee) {
-        return CompletableFuture.runAsync(() -> {
-            try (PreparedStatement ps = this.connection.prepareStatement(
-                    "UPDATE bounties SET total_amount = ?, contract_fees_deducted = contract_fees_deducted + ? WHERE id = ?")) {
-                ps.setDouble(1, newAmount);
-                ps.setDouble(2, contractFee);
-                ps.setInt(3, bountyId);
-                ps.executeUpdate();
-            } catch (SQLException e) {
-                LOGGER.error("Failed to update bounty amount", e);
+    /**
+     * Atomic confiscation: transitions the given bounties to CANCELLED and
+     * credits {@code amount} to the treasury in ONE database transaction. Every
+     * row must still be in one of {@code expected} (compare-and-set) — a row
+     * that raced with a claim or another cancel aborts the whole operation with
+     * nothing changed. Returns the fresh treasury snapshot, or {@code null} on
+     * failure/race (callers report and skip).
+     */
+    public CompletableFuture<TreasuryManager.TreasurySnapshot> confiscateBounties(
+            List<Integer> bountyIds, java.util.EnumSet<BountyStatus> expected, double amount, String note) {
+        return this.supply(() -> {
+            if (bountyIds == null || bountyIds.isEmpty()
+                    || expected == null || expected.isEmpty()
+                    || !Double.isFinite(amount) || amount <= 0.0) {
+                return null;
             }
-        }, this.executor);
+            String codes = expected.stream().map(s -> String.valueOf(s.getCode()))
+                    .reduce((a, b) -> a + ", " + b).orElse("");
+            try {
+                this.connection.setAutoCommit(false);
+                try {
+                    int changed = 0;
+                    try (PreparedStatement ps = this.connection.prepareStatement(
+                            "UPDATE bounties SET status = ? WHERE id = ? AND status IN (" + codes + ")")) {
+                        ps.setInt(1, BountyStatus.CANCELLED.getCode());
+                        for (int id : bountyIds) {
+                            ps.setInt(2, id);
+                            changed += ps.executeUpdate();
+                        }
+                    }
+                    if (changed != bountyIds.size()) {
+                        this.connection.rollback();
+                        return null;
+                    }
+                    this.insertLedgerRow(TreasuryManager.Category.CONFISCATION, amount, note);
+                    this.applyTreasuryRow(TreasuryManager.Category.CONFISCATION, amount);
+                    this.connection.commit();
+                    return this.readTreasury();
+                } finally {
+                    this.connection.setAutoCommit(true);
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed confiscation of bounties {} — rolled back", bountyIds, e);
+                this.quietRollback();
+                return null;
+            }
+        });
     }
 
-    /** Expires overdue bounties and returns them so the caller can refund placers. */
+    /**
+     * CAS-style cancel used by placement rollback: only cancels the bounty while
+     * it is still in a live status — a kill that claimed it in the micro-window
+     * keeps its claim (the caller then logs CRITICAL and refunds the placer).
+     */
+    public CompletableFuture<Boolean> cancelIfActive(int bountyId) {
+        return this.supply(() -> {
+            try (PreparedStatement ps = this.connection.prepareStatement(
+                    "UPDATE bounties SET status = ? WHERE id = ? AND status IN (0, 4)")) {
+                ps.setInt(1, BountyStatus.CANCELLED.getCode());
+                ps.setInt(2, bountyId);
+                return ps.executeUpdate() > 0;
+            } catch (SQLException e) {
+                LOGGER.error("Failed to cancel bounty #{}", bountyId, e);
+                return false;
+            }
+        });
+    }
+
+    /**
+     * Atomic contract-fee decay: the bounty row, the treasury ledger row and the
+     * treasury balance move in ONE database transaction, so a failure can never
+     * leave the bounty decayed without the treasury being credited (or the
+     * reverse). Returns the fresh treasury snapshot, or {@code null} when the
+     * bounty is no longer in a live status or the transaction failed.
+     */
+    public CompletableFuture<TreasuryManager.TreasurySnapshot> applyContractFee(
+            int bountyId, double newAmount, double fee, String note) {
+        return this.supply(() -> {
+            if (!Double.isFinite(newAmount) || newAmount < 0.0 || !Double.isFinite(fee) || fee <= 0.0) {
+                return null;
+            }
+            try {
+                this.connection.setAutoCommit(false);
+                try {
+                    int changed;
+                    try (PreparedStatement ps = this.connection.prepareStatement(
+                            "UPDATE bounties SET total_amount = ?, contract_fees_deducted = contract_fees_deducted + ? WHERE id = ? AND status IN (0, 4)")) {
+                        ps.setDouble(1, newAmount);
+                        ps.setDouble(2, fee);
+                        ps.setInt(3, bountyId);
+                        changed = ps.executeUpdate();
+                    }
+                    if (changed == 0) {
+                        this.connection.rollback();
+                        return null;
+                    }
+                    this.insertLedgerRow(TreasuryManager.Category.FEE, fee, note);
+                    this.applyTreasuryRow(TreasuryManager.Category.FEE, fee);
+                    this.connection.commit();
+                    return this.readTreasury();
+                } finally {
+                    this.connection.setAutoCommit(true);
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed contract fee for bounty #{} — rolled back", bountyId, e);
+                this.quietRollback();
+                return null;
+            }
+        });
+    }
+
+    /**
+     * Expires overdue bounties (marking them refund-pending in the same task) and
+     * returns them so the caller can refund placers. The pending flag lets
+     * {@link #claimNextRefundPending()} retry refunds a crash may have stranded.
+     */
     public CompletableFuture<List<BountyEntry>> expireOldBounties() {
         return this.supply(() -> {
             List<BountyEntry> toExpire = new ArrayList<>();
@@ -389,7 +532,7 @@ public final class EnforcerStorage {
             }
             for (BountyEntry bounty : toExpire) {
                 try (PreparedStatement ps = this.connection.prepareStatement(
-                        "UPDATE bounties SET status = ? WHERE id = ? AND " + ACTIVE_FILTER)) {
+                        "UPDATE bounties SET status = ?, refund_pending = 1 WHERE id = ? AND " + ACTIVE_FILTER)) {
                     ps.setInt(1, BountyStatus.EXPIRED.getCode());
                     ps.setInt(2, bounty.id());
                     ps.executeUpdate();
@@ -398,6 +541,42 @@ public final class EnforcerStorage {
                 }
             }
             return toExpire;
+        });
+    }
+
+    /**
+     * Claims ONE refund-pending expired bounty for a refund attempt. The claim
+     * clears the pending flag in the same task — money-out operations follow the
+     * prefer-loss-over-double-pay rule, so the flag is cleared BEFORE the payout
+     * is attempted. Returns {@code null} when nothing is pending.
+     */
+    public CompletableFuture<BountyEntry> claimNextRefundPending() {
+        return this.supply(() -> {
+            BountyEntry bounty = null;
+            try (PreparedStatement ps = this.connection.prepareStatement(
+                    "SELECT * FROM bounties WHERE status = ? AND refund_pending = 1 ORDER BY expire_timestamp LIMIT 1")) {
+                ps.setInt(1, BountyStatus.EXPIRED.getCode());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        bounty = this.mapBounty(rs);
+                    }
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to read refund-pending bounties", e);
+                return null;
+            }
+            if (bounty == null) {
+                return null;
+            }
+            try (PreparedStatement ps = this.connection.prepareStatement(
+                    "UPDATE bounties SET refund_pending = 0 WHERE id = ?")) {
+                ps.setInt(1, bounty.id());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                LOGGER.error("Failed to claim refund for bounty #{}", bounty.id(), e);
+                return null;
+            }
+            return bounty;
         });
     }
 
@@ -478,14 +657,22 @@ public final class EnforcerStorage {
     }
 
     /**
-     * Applies a signed treasury movement inside one task: updates the row,
-     * appends the ledger, and returns the fresh snapshot so the caller's
-     * in-memory mirror can be updated atomically with the DB.
+     * Applies a treasury movement inside ONE database transaction (ledger row +
+     * treasury row together, so they can never drift apart on a crash):
      *
-     * Payout/auto-fund categories move balance DOWN (money leaves the pot);
-     * tax/fee/confiscation move it UP; burn raises burned without changing
-     * balance semantics handled by the caller's split (burn already left the
-     * bounty amount).
+     * <ul>
+     *   <li>TAX / FEE / CONFISCATION — balance UP, collected-tax stat up;</li>
+     *   <li>BURN — {@code total_burned} stat only, balance UNCHANGED: the burn
+     *       share left the economy at placement time and must never become
+     *       spendable by autonomous funding;</li>
+     *   <li>PAYOUT / AUTO_FUND — balance DOWN (money leaves the pot);</li>
+     *   <li>AUTO_REFUND — balance UP and the paid-bounty stat rolled back: this is
+     *       the compensation leg when an autonomous placement fails after
+     *       funding.</li>
+     * </ul>
+     *
+     * Failures complete the future exceptionally (fail-loud) — callers must
+     * compensate; nothing is half-applied.
      */
     public CompletableFuture<TreasuryManager.TreasurySnapshot> adjustTreasury(
             TreasuryManager.Category category, double amount, String note) {
@@ -493,35 +680,70 @@ public final class EnforcerStorage {
             if (!Double.isFinite(amount) || amount == 0.0) {
                 return this.readTreasury();
             }
-            boolean decreases = category == TreasuryManager.Category.PAYOUT
-                    || category == TreasuryManager.Category.AUTO_FUND
-                    || category == TreasuryManager.Category.AUTO_REFUND;
-            double signed = decreases ? -Math.abs(amount) : Math.abs(amount);
             try {
-                try (PreparedStatement ledger = this.connection.prepareStatement(
-                        "INSERT INTO treasury_ledger (category, amount, note, timestamp) VALUES (?, ?, ?, ?)")) {
-                    ledger.setString(1, category.name());
-                    ledger.setDouble(2, signed);
-                    ledger.setString(3, note);
-                    ledger.setLong(4, System.currentTimeMillis());
-                    ledger.executeUpdate();
-                }
-                String column = switch (category) {
-                    case BURN -> "total_burned";
-                    case PAYOUT, AUTO_FUND, AUTO_REFUND -> "total_paid_bounties";
-                    default -> "total_collected_tax";
-                };
-                try (PreparedStatement ps = this.connection.prepareStatement(
-                        "UPDATE treasury SET balance = balance + ?, " + column + " = " + column + " + ABS(?) WHERE id = 1")) {
-                    ps.setDouble(1, signed);
-                    ps.setDouble(2, Math.abs(amount));
-                    ps.executeUpdate();
+                this.connection.setAutoCommit(false);
+                try {
+                    this.insertLedgerRow(category, amount, note);
+                    this.applyTreasuryRow(category, amount);
+                    this.connection.commit();
+                } finally {
+                    this.connection.setAutoCommit(true);
                 }
             } catch (SQLException e) {
-                LOGGER.error("Failed treasury adjustment ({} {})", category, amount, e);
+                LOGGER.error("Failed treasury adjustment ({} {}) — rolled back", category, amount, e);
+                this.quietRollback();
+                throw new IllegalStateException("Treasury adjustment failed: " + category, e);
             }
             return this.readTreasury();
         });
+    }
+
+    /** Ledger row for a movement; the sign carries the direction. */
+    private void insertLedgerRow(TreasuryManager.Category category, double amount, String note) throws SQLException {
+        double signed = category == TreasuryManager.Category.PAYOUT || category == TreasuryManager.Category.AUTO_FUND
+                ? -Math.abs(amount)
+                : Math.abs(amount);
+        try (PreparedStatement ledger = this.connection.prepareStatement(
+                "INSERT INTO treasury_ledger (category, amount, note, timestamp) VALUES (?, ?, ?, ?)")) {
+            ledger.setString(1, category.name());
+            ledger.setDouble(2, signed);
+            ledger.setString(3, note);
+            ledger.setLong(4, System.currentTimeMillis());
+            ledger.executeUpdate();
+        }
+    }
+
+    /** Treasury row movement per category semantics (see adjustTreasury docs). */
+    private void applyTreasuryRow(TreasuryManager.Category category, double amount) throws SQLException {
+        switch (category) {
+            case BURN -> this.updateTreasuryRow(
+                    "UPDATE treasury SET total_burned = total_burned + ? WHERE id = 1", amount);
+            case PAYOUT, AUTO_FUND -> this.updateTreasuryRow(
+                    "UPDATE treasury SET balance = balance - ?, total_paid_bounties = total_paid_bounties + ? WHERE id = 1",
+                    amount, amount);
+            case AUTO_REFUND -> this.updateTreasuryRow(
+                    "UPDATE treasury SET balance = balance + ?, total_paid_bounties = MAX(total_paid_bounties - ?, 0) WHERE id = 1",
+                    amount, amount);
+            default -> this.updateTreasuryRow(
+                    "UPDATE treasury SET balance = balance + ?, total_collected_tax = total_collected_tax + ? WHERE id = 1",
+                    amount, amount);
+        }
+    }
+
+    private void updateTreasuryRow(String sql, double... params) throws SQLException {
+        try (PreparedStatement ps = this.connection.prepareStatement(sql)) {
+            for (int i = 0; i < params.length; i++) {
+                ps.setDouble(i + 1, Math.abs(params[i]));
+            }
+            ps.executeUpdate();
+        }
+    }
+
+    private void quietRollback() {
+        try {
+            this.connection.rollback();
+        } catch (SQLException ignored) {
+        }
     }
 
     public CompletableFuture<List<String>> readTreasuryLedger(int limit) {
@@ -548,9 +770,10 @@ public final class EnforcerStorage {
 
     /**
      * Atomic autonomous-bounty funding: reads the balance and deducts inside a
-     * single worker task, so two cycles can never overdraw the treasury.
+     * single worker task (so two cycles can never overdraw the treasury), with
+     * the ledger row and the balance row applied in ONE database transaction.
      * Returns the fresh snapshot on success, or {@code null} when funds are
-     * insufficient (caller skips placement).
+     * insufficient or the transaction failed (caller skips placement).
      */
     public CompletableFuture<TreasuryManager.TreasurySnapshot> tryFundAutonomousBounty(double amount, String note) {
         return this.supply(() -> {
@@ -562,22 +785,17 @@ public final class EnforcerStorage {
                 return null;
             }
             try {
-                try (PreparedStatement ledger = this.connection.prepareStatement(
-                        "INSERT INTO treasury_ledger (category, amount, note, timestamp) VALUES (?, ?, ?, ?)")) {
-                    ledger.setString(1, TreasuryManager.Category.AUTO_FUND.name());
-                    ledger.setDouble(2, -amount);
-                    ledger.setString(3, note);
-                    ledger.setLong(4, System.currentTimeMillis());
-                    ledger.executeUpdate();
-                }
-                try (PreparedStatement ps = this.connection.prepareStatement(
-                        "UPDATE treasury SET balance = balance - ?, total_paid_bounties = total_paid_bounties + ? WHERE id = 1")) {
-                    ps.setDouble(1, amount);
-                    ps.setDouble(2, amount);
-                    ps.executeUpdate();
+                this.connection.setAutoCommit(false);
+                try {
+                    this.insertLedgerRow(TreasuryManager.Category.AUTO_FUND, amount, note);
+                    this.applyTreasuryRow(TreasuryManager.Category.AUTO_FUND, amount);
+                    this.connection.commit();
+                } finally {
+                    this.connection.setAutoCommit(true);
                 }
             } catch (SQLException e) {
-                LOGGER.error("Failed to fund autonomous bounty", e);
+                LOGGER.error("Failed to fund autonomous bounty — rolled back", e);
+                this.quietRollback();
                 return null;
             }
             return this.readTreasury();
@@ -588,8 +806,13 @@ public final class EnforcerStorage {
     // Hunter licenses
     // ------------------------------------------------------------------
 
-    public CompletableFuture<Void> saveLicense(LicenseData license) {
-        return CompletableFuture.runAsync(() -> {
+    /**
+     * Persists a license. Returns {@code true} only when the row was actually
+     * written — a failed write completes with {@code false} so the purchase
+     * path can refund the player (fail-closed money rule).
+     */
+    public CompletableFuture<Boolean> saveLicense(LicenseData license) {
+        return this.supply(() -> {
             String sql = """
                     INSERT INTO hunter_licenses (player_uuid, player_name, tier, purchase_timestamp, expire_timestamp, active)
                     VALUES (?, ?, ?, ?, ?, ?)
@@ -607,10 +830,12 @@ public final class EnforcerStorage {
                 ps.setLong(5, license.expireTimestamp());
                 ps.setInt(6, license.active() ? 1 : 0);
                 ps.executeUpdate();
+                return true;
             } catch (SQLException e) {
                 LOGGER.error("Failed to save license", e);
+                return false;
             }
-        }, this.executor);
+        });
     }
 
     public CompletableFuture<Optional<LicenseData>> getLicense(UUID playerUuid) {
@@ -637,7 +862,7 @@ public final class EnforcerStorage {
     }
 
     public CompletableFuture<Void> deactivateLicense(UUID playerUuid) {
-        return CompletableFuture.runAsync(() -> {
+        return this.run(() -> {
             try (PreparedStatement ps = this.connection.prepareStatement(
                     "UPDATE hunter_licenses SET active = 0 WHERE player_uuid = ?")) {
                 ps.setString(1, playerUuid.toString());
@@ -645,7 +870,7 @@ public final class EnforcerStorage {
             } catch (SQLException e) {
                 LOGGER.error("Failed to deactivate license", e);
             }
-        }, this.executor);
+        });
     }
 
     /** Flags licenses whose expiry has passed as inactive; returns count. */
@@ -671,7 +896,7 @@ public final class EnforcerStorage {
     // ------------------------------------------------------------------
 
     public CompletableFuture<Void> recordDamage(UUID targetUuid, UUID attackerUuid, String attackerName, double damage) {
-        return CompletableFuture.runAsync(() -> {
+        return this.run(() -> {
             String sql = "INSERT INTO damage_records (target_uuid, attacker_uuid, attacker_name, damage, timestamp) VALUES (?, ?, ?, ?, ?)";
             try (PreparedStatement ps = this.connection.prepareStatement(sql)) {
                 ps.setString(1, targetUuid.toString());
@@ -683,7 +908,7 @@ public final class EnforcerStorage {
             } catch (SQLException e) {
                 LOGGER.error("Failed to record damage", e);
             }
-        }, this.executor);
+        });
     }
 
     public CompletableFuture<java.util.Map<UUID, Double>> getDamageContributions(UUID targetUuid, long windowMs) {
@@ -731,7 +956,7 @@ public final class EnforcerStorage {
     }
 
     public CompletableFuture<Void> clearDamageRecords(UUID targetUuid) {
-        return CompletableFuture.runAsync(() -> {
+        return this.run(() -> {
             try (PreparedStatement ps = this.connection.prepareStatement(
                     "DELETE FROM damage_records WHERE target_uuid = ?")) {
                 ps.setString(1, targetUuid.toString());
@@ -739,7 +964,7 @@ public final class EnforcerStorage {
             } catch (SQLException e) {
                 LOGGER.error("Failed to clear damage records", e);
             }
-        }, this.executor);
+        });
     }
 
     public CompletableFuture<Integer> cleanupOldDamageRecords(long maxAgeMs) {
@@ -760,7 +985,7 @@ public final class EnforcerStorage {
     // ------------------------------------------------------------------
 
     public CompletableFuture<Void> recordKill(UUID killerUuid, String killerName, UUID victimUuid, String victimName) {
-        return CompletableFuture.runAsync(() -> {
+        return this.run(() -> {
             try {
                 try (PreparedStatement event = this.connection.prepareStatement(
                         "INSERT INTO kill_events (killer_uuid, victim_uuid, timestamp) VALUES (?, ?, ?)")) {
@@ -800,7 +1025,7 @@ public final class EnforcerStorage {
             } catch (SQLException e) {
                 LOGGER.error("Failed to record kill", e);
             }
-        }, this.executor);
+        });
     }
 
     public CompletableFuture<Optional<KillStats>> getKillStats(UUID playerUuid) {
@@ -901,7 +1126,7 @@ public final class EnforcerStorage {
     }
 
     public CompletableFuture<Void> flagCollusion(UUID player1, String name1, UUID player2, String name2, String reason) {
-        return CompletableFuture.runAsync(() -> {
+        return this.run(() -> {
             String sql = "INSERT INTO collusion_flags (player1_uuid, player1_name, player2_uuid, player2_name, reason, timestamp) VALUES (?, ?, ?, ?, ?, ?)";
             try (PreparedStatement ps = this.connection.prepareStatement(sql)) {
                 ps.setString(1, player1.toString());
@@ -915,7 +1140,7 @@ public final class EnforcerStorage {
             } catch (SQLException e) {
                 LOGGER.error("Failed to flag collusion", e);
             }
-        }, this.executor);
+        });
     }
 
     public CompletableFuture<Integer> cleanupOldKillEvents(long maxAgeMs) {

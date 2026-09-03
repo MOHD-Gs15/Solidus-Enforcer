@@ -10,6 +10,7 @@ import com.solidus.enforcer.security.AntiExploitEngine;
 import com.solidus.enforcer.storage.EnforcerStorage;
 import com.solidus.enforcer.util.ConfigManager;
 import com.solidus.enforcer.util.TextUtil;
+import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,6 +59,18 @@ public final class KillProcessor {
         this.treasury = treasury;
     }
 
+    /** Outcome of the payment fan-out: decides revert vs keep-claimed. */
+    record PayoutVerdict(long succeeded, long failed) {
+        /** Reverting is only safe while NO money has left the treasury-backed bounty. */
+        boolean revertAll() {
+            return this.failed > 0 && this.succeeded == 0;
+        }
+
+        static PayoutVerdict of(long succeeded, long failed) {
+            return new PayoutVerdict(succeeded, failed);
+        }
+    }
+
     /**
      * @param inventorySnapshot gear value captured synchronously at death time
      */
@@ -82,15 +95,18 @@ public final class KillProcessor {
                         if (exploitResult.payoutRatio() <= 0.0) {
                             // Fraud: confiscate the claimed bounties to the treasury.
                             return this.confiscateClaimed(claimed, exploitResult, victim, killer, server)
-                                    .thenApply(ignored -> true);
+                                    .thenApply(ignored -> (Boolean) null);
                         }
                         double payable = EconomyMath.round2(totalBounty * exploitResult.payoutRatio());
                         return this.damageTracker.getDamageContributions(victimUuid)
                                 .thenCompose(contributions ->
                                         this.settlePayout(claimed, victim, killer, contributions,
-                                                payable, exploitResult, totalBounty, server));
+                                                payable, exploitResult, totalBounty, server))
+                                .thenApply(ignored -> (Boolean) null);
                     })
                     .exceptionally(error -> {
+                        // Only PRE-PAYMENT failures reach here: settlePayout handles its
+                        // own tail and never lets a post-payment failure revert paid money.
                         LOGGER.error("Bounty settlement failed for victim {} — reverting claim", victimUuid, error);
                         this.revert(claimed);
                         return null;
@@ -98,7 +114,7 @@ public final class KillProcessor {
         });
     }
 
-    private CompletableFuture<Boolean> settlePayout(List<BountyEntry> claimed, ServerPlayer victim,
+    private CompletableFuture<Void> settlePayout(List<BountyEntry> claimed, ServerPlayer victim,
                                                  ServerPlayer killer, Map<UUID, Double> contributions,
                                                  double payable, AntiExploitEngine.ExploitCheckResult exploitResult,
                                                  double totalBounty, MinecraftServer server) {
@@ -117,41 +133,98 @@ public final class KillProcessor {
                             entry.getValue(), victim, server))
                     .toList();
 
+            // Compose the payment fan-out so that its failure handling knows exactly
+            // how much money has already left — reverting a PARTIALLY paid claim would
+            // re-arm the bounties and re-pay the successful recipients on the next kill.
             return CompletableFuture.allOf(payments.toArray(CompletableFuture[]::new))
-                    .thenApply(ignored -> payments.stream().allMatch(CompletableFuture::join))
-                    .thenCompose(allPaid -> {
-                        if (!allPaid) {
-                            LOGGER.error("Partial payout failure for victim {} — reverting {} bounties",
+                    .thenApply(ignored -> {
+                        long succeeded = payments.stream().filter(p -> p.getNow(false)).count();
+                        return PayoutVerdict.of(succeeded, payments.size() - succeeded);
+                    })
+                    .thenCompose(verdict -> {
+                        if (verdict.failed() == 0) {
+                            return this.finalizeSettlement(claimed, victim, killer, payouts,
+                                    exploitResult, totalBounty, payable, server);
+                        }
+                        if (verdict.revertAll()) {
+                            // Nothing was paid — safe to put the bounties back up for grabs.
+                            LOGGER.error("All bounty payments failed for victim {} — reverting {} bounties to ACTIVE",
                                     victim.getUUID(), claimed.size());
                             this.revert(claimed);
-                            return CompletableFuture.completedFuture(false);
+                            return CompletableFuture.completedFuture((Void) null);
                         }
-                        return this.storage.recordKill(killer.getUUID(), killer.getName().getString(),
-                                        victim.getUUID(), victim.getName().getString())
-                                .thenRun(() -> this.damageTracker.clearRecords(victim.getUUID()))
-                                .thenRun(() -> server.execute(() -> BountyAnnouncer.announceClaim(
-                                        claimed, victim, killer, totalBounty, payable, exploitResult, server,
-                                        payouts)))
-                                .thenApply(v -> true);
+                        // Partial payout: money has left. The claim stays CLAIMED so it can
+                        // never be re-paid; unpaid shares require manual reconciliation.
+                        LOGGER.error("CRITICAL: partial bounty payout for victim {} — {} of {} payments failed; "
+                                        + "bounties stay CLAIMED (ids {}) for manual reconciliation; damage records kept as evidence",
+                                victim.getUUID(), verdict.failed(), verdict.succeeded() + verdict.failed(),
+                                claimed.stream().map(BountyEntry::id).toList());
+                        return CompletableFuture.completedFuture((Void) null);
                     });
         });
     }
 
-    /** Collusion path: bounties are cancelled and their value confiscated. */
+    /**
+     * Post-payment bookkeeping. Every stage is exception-safe: a failure here is
+     * logged loudly but NEVER reverts the claim — the money has already moved.
+     */
+    private CompletableFuture<Void> finalizeSettlement(List<BountyEntry> claimed, ServerPlayer victim,
+                                                        ServerPlayer killer, LinkedHashMap<UUID, Double> payouts,
+                                                        AntiExploitEngine.ExploitCheckResult exploitResult,
+                                                        double totalBounty, double payable, MinecraftServer server) {
+        return this.storage.recordKill(killer.getUUID(), killer.getName().getString(),
+                        victim.getUUID(), victim.getName().getString())
+                .handle((ignored, error) -> {
+                    if (error != null) {
+                        LOGGER.error("Kill stats recording failed for victim {} (payout already settled)",
+                                victim.getUUID(), error);
+                    }
+                    return null;
+                })
+                .thenRun(() -> {
+                    try {
+                        this.damageTracker.clearRecords(victim.getUUID());
+                    } catch (RuntimeException ex) {
+                        LOGGER.error("Damage record cleanup failed for victim {} (payout already settled)",
+                                victim.getUUID(), ex);
+                    }
+                })
+                .thenAccept(v -> {
+                    try {
+                        server.execute(() -> BountyAnnouncer.announceClaim(
+                                claimed, victim, killer, totalBounty, payable, exploitResult, server,
+                                payouts));
+                    } catch (RuntimeException rejected) {
+                        LOGGER.error("Claim announcement skipped (server shutting down?) — payout already settled",
+                                rejected);
+                    }
+                });
+    }
+
+    /** Collusion path: bounties are cancelled and their value confiscated (atomic CAS). */
     private CompletableFuture<Void> confiscateClaimed(List<BountyEntry> claimed,
                                                       AntiExploitEngine.ExploitCheckResult exploitResult,
                                                       ServerPlayer victim, ServerPlayer killer, MinecraftServer server) {
         double confiscated = claimed.stream().mapToDouble(BountyEntry::totalAmount).sum();
-        CompletableFuture<Void> tail = CompletableFuture.completedFuture(null);
-        for (BountyEntry bounty : claimed) {
-            tail = tail.thenCompose(v -> this.storage.updateBountyStatus(bounty.id(), BountyStatus.CANCELLED));
-        }
-        return tail.thenCompose(v -> this.storage.adjustTreasury(
-                        com.solidus.enforcer.economy.TreasuryManager.Category.CONFISCATION, confiscated,
-                        "collusion: bounty on " + victim.getName().getString()))
-                .thenAccept(this.treasury::applySnapshot)
-                .thenRun(() -> server.execute(() -> BountyAnnouncer.announceDenial(
-                        victim, killer, exploitResult.message(), confiscated, server)));
+        List<Integer> ids = claimed.stream().map(BountyEntry::id).toList();
+        return this.storage.confiscateBounties(ids, EnumSet.of(BountyStatus.CLAIMED), confiscated,
+                        "collusion: bounty on " + victim.getName().getString())
+                .thenAccept(snapshot -> {
+                    if (snapshot == null) {
+                        LOGGER.error("CRITICAL: collusion confiscation failed for bounties {} — "
+                                + "rows keep their status; manual reconciliation required", ids);
+                    } else {
+                        this.treasury.applySnapshot(snapshot);
+                    }
+                })
+                .thenRun(() -> {
+                    try {
+                        server.execute(() -> BountyAnnouncer.announceDenial(
+                                victim, killer, exploitResult.message(), confiscated, server));
+                    } catch (RuntimeException rejected) {
+                        LOGGER.error("Denial announcement skipped (server shutting down?)", rejected);
+                    }
+                });
     }
 
     /** Compensation path: puts an interrupted payout back up for grabs. */

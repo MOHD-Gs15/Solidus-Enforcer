@@ -137,10 +137,20 @@ public final class AutonomousBountyEngine {
                                 reason, this.config.getBountyDurationDays());
                         this.storage.insertBounty(bounty).thenAccept(id -> {
                             if (id == null || id <= 0) {
-                                // Roll the funding back so the money is not lost.
+                                // Roll the funding back so the money is not lost: AUTO_REFUND
+                                // restores the balance and rolls the paid-bounty stat back.
                                 this.storage.adjustTreasury(TreasuryManager.Category.AUTO_REFUND, suggested,
-                                        "auto bounty insert failed: " + targetName)
-                                        .thenAccept(this.treasury::applySnapshot);
+                                                "auto bounty insert failed: " + targetName)
+                                        .handle((restored, rollbackError) -> {
+                                            if (rollbackError != null) {
+                                                LOGGER.error("CRITICAL: auto-bounty funding rollback failed for {} ({}) "
+                                                        + "— treasury short by {}; manual reconciliation required",
+                                                        targetName, suggested, suggested, rollbackError);
+                                            } else {
+                                                this.treasury.applySnapshot(restored);
+                                            }
+                                            return null;
+                                        });
                                 LOGGER.error("Failed to persist autonomous bounty on {} — funding refunded", targetName);
                                 return;
                             }

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.solidus.enforcer.license.HunterLicenseManager;
 import com.solidus.enforcer.security.CollusionDetector.Decision;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
@@ -101,5 +102,23 @@ class LicenseAndCollusionPolicyTest {
         Decision.Policy policy = new Decision(1, 1, 7).evaluate(3, 2, 5);
         assertTrue(policy.flagged());
         assertTrue(policy.reason().contains("transfers"));
+    }
+
+    // ------------------------------------------------------------------
+    // Renewal expiry math (a renewal extends, never restarts)
+    // ------------------------------------------------------------------
+
+    @Test
+    void renewalExtendsFromTheCurrentExpiry() {
+        long now = System.currentTimeMillis();
+        long sevenDays = 7L * 86_400_000L;
+        long twoDaysLeft = now + 2L * 86_400_000L;
+
+        assertEquals(twoDaysLeft + sevenDays,
+                HunterLicenseManager.computeExpiry(now, twoDaysLeft, sevenDays));
+        assertEquals(now + sevenDays, HunterLicenseManager.computeExpiry(now, null, sevenDays));
+        assertEquals(now + sevenDays,
+                HunterLicenseManager.computeExpiry(now, now - 1000L, sevenDays),
+                "a lapsed license restarts from now");
     }
 }
