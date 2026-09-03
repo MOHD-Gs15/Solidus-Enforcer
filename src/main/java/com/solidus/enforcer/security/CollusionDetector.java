@@ -3,8 +3,6 @@ package com.solidus.enforcer.security;
 import com.solidus.enforcer.integration.SolidusBridge;
 import com.solidus.enforcer.storage.EnforcerStorage;
 import com.solidus.enforcer.util.ConfigManager;
-import java.util.HashSet;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import org.slf4j.Logger;
@@ -65,29 +63,36 @@ public final class CollusionDetector {
                 });
     }
 
-    /** Victim->killer and killer->victim transfers inside the lookback window. */
+    /**
+     * Victim-to-killer and killer-to-victim transfers inside the lookback window.
+     * Each matching transaction ROW counts as one transfer — the union-of-sets
+     * formulation used before could only ever yield 0, 1 or 2 (it counted
+     * directions, not transactions) and the documented money-loop signal never
+     * fired. Bounded by Core's per-player transaction query limit (100 rows).
+     */
     private CompletableFuture<Integer> fetchMutualTransfers(UUID killerUuid, UUID victimUuid) {
         int lookbackDays = this.config.getTransactionLookbackDays();
         long cutoff = System.currentTimeMillis() - lookbackDays * 86_400_000L;
-        CompletableFuture<Set<UUID>> killerSent = SolidusBridge.getTransactions(killerUuid, 100)
-                .thenApply(rows -> this.filter(rows, victimUuid, cutoff));
-        CompletableFuture<Set<UUID>> victimSent = SolidusBridge.getTransactions(victimUuid, 100)
-                .thenApply(rows -> this.filter(rows, killerUuid, cutoff));
-        return killerSent.thenCombine(victimSent, (a, b) -> {
-            Set<UUID> union = new HashSet<>(a);
-            union.addAll(b);
-            return union.size();
-        });
+        CompletableFuture<Integer> killerSent = SolidusBridge.getTransactions(killerUuid, 100)
+                .thenApply(rows -> countMatchingTransactions(rows, victimUuid, cutoff));
+        CompletableFuture<Integer> victimSent = SolidusBridge.getTransactions(victimUuid, 100)
+                .thenApply(rows -> countMatchingTransactions(rows, killerUuid, cutoff));
+        return killerSent.thenCombine(victimSent, Integer::sum);
     }
 
-    private Set<UUID> filter(java.util.List<SolidusBridge.TransactionEntryData> rows, UUID counterparty, long cutoff) {
-        Set<UUID> matched = new HashSet<>();
+    /** Rows whose target is the counterparty and whose timestamp is inside the window. */
+    static int countMatchingTransactions(java.util.List<SolidusBridge.TransactionEntryData> rows,
+                                         UUID counterparty, long cutoff) {
+        if (rows == null || counterparty == null) {
+            return 0;
+        }
+        int count = 0;
         for (SolidusBridge.TransactionEntryData row : rows) {
             if (row.timestamp() >= cutoff && counterparty.equals(row.targetUuid())) {
-                matched.add(counterparty);
+                count++;
             }
         }
-        return matched;
+        return count;
     }
 
     public record CollusionResult(boolean flagged, String reason) {

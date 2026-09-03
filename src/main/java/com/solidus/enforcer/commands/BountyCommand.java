@@ -76,18 +76,21 @@ public final class BountyCommand {
                         "You need a Hunter License to place bounties — /hunter tiers", TextUtil.COLOR_BAD));
                 return;
             }
-            bountyManager.placeBounty(placer, target, amount).thenAccept(result -> {
-                ServerPlayer still = ctx.getSource().getServer().getPlayerList().getPlayer(placer.getUUID());
-                if (still == null) {
-                    return;
-                }
-                if (result.success()) {
-                    still.sendSystemMessage(TextUtil.branded(result.message(), TextUtil.COLOR_GOOD));
-                    mod.getAnnouncer().announceNewBounty(result.bounty(), still.level().getServer());
-                } else {
-                    still.sendSystemMessage(TextUtil.branded(result.message(), TextUtil.COLOR_BAD));
-                }
-            });
+            bountyManager.placeBounty(placer, target, amount).thenAccept(result ->
+                    ctx.getSource().getServer().execute(() -> {
+                        // Delivery and the announcement (which walks the live player
+                        // list) happen on the server thread, never on a Core/storage thread.
+                        ServerPlayer still = ctx.getSource().getServer().getPlayerList().getPlayer(placer.getUUID());
+                        if (still == null) {
+                            return;
+                        }
+                        if (result.success()) {
+                            still.sendSystemMessage(TextUtil.branded(result.message(), TextUtil.COLOR_GOOD));
+                            mod.getAnnouncer().announceNewBounty(result.bounty(), still.level().getServer());
+                        } else {
+                            still.sendSystemMessage(TextUtil.branded(result.message(), TextUtil.COLOR_BAD));
+                        }
+                    }));
         });
         return 1;
     }
@@ -214,11 +217,20 @@ public final class BountyCommand {
             return 0;
         }
         BountyManager bountyManager = mod.getBountyManager();
-        if (bountyManager == null) {
+        HunterLicenseManager licenseManager = mod.getLicenseManager();
+        if (bountyManager == null || licenseManager == null) {
             ctx.getSource().sendFailure(TextUtil.branded("Enforcer is not ready yet.", TextUtil.COLOR_BAD));
             return 0;
         }
-        bountyManager.getActiveBounties().thenAccept(bounties -> ctx.getSource().getServer().execute(() -> {
+        final UUID viewerUuid = player.getUUID();
+        // The board contract gates place/list/info/top behind a Hunter License.
+        licenseManager.hasActiveLicense(viewerUuid).thenAccept(licensed -> {
+            if (!licensed) {
+                ctx.getSource().getServer().execute(() -> player.sendSystemMessage(TextUtil.branded(
+                        "You need a Hunter License to view bounties — /hunter tiers", TextUtil.COLOR_BAD)));
+                return;
+            }
+            bountyManager.getActiveBounties().thenAccept(bounties -> ctx.getSource().getServer().execute(() -> {
             LinkedHashMap<String, Double> mostWanted = new LinkedHashMap<>();
             for (BountyEntry b : bounties) {
                 mostWanted.merge(b.targetName(), b.totalAmount(), Double::sum);
@@ -244,6 +256,7 @@ public final class BountyCommand {
             msg = msg.append(Component.literal("\n")).append(TextUtil.separator());
             player.sendSystemMessage(msg);
         }));
+        });
         return 1;
     }
 

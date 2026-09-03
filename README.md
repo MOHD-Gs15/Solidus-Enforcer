@@ -8,7 +8,9 @@
 
 **Bounty hunting, hunter licenses, alliance payouts, anti-exploit enforcement and collusion detection for the Solidus economy ecosystem — 100% server-side.**
 
-*Rebuilt v1.1, aligned to the 2.1.0 family: this codebase was reconstructed from a decompiled artifact and then re-audited end to end. Every money path is now atomic, the tick thread never blocks, and every advertised feature actually exists — proven by CI on every push. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [VERSIONING.md](VERSIONING.md).*
+*Rebuilt v1.1, aligned to the 2.1 family: this codebase was reconstructed from a decompiled artifact and then re-audited end to end. Every money path is now atomic, the tick thread never blocks, and every advertised feature actually exists — proven by CI on every push.*
+
+*2.1.1 — security audit round 1: partial-payout revert duplication, inverted burn/refund treasury semantics, dead license refund path, non-atomic confiscation/contract fees, stranded expiry refunds, an inert money-loop collusion signal and unvalidated live tracking are all fixed and regression-tested (46 tests). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §12 and [VERSIONING.md](VERSIONING.md).*
 
 ---
 

@@ -99,7 +99,7 @@ public final class SolidusEnforcerMod implements DedicatedServerModInitializer {
 
         this.bountyManager = new BountyManager(this.storage, this.configManager, this.treasury);
         this.licenseManager = new HunterLicenseManager(this.storage, this.configManager);
-        this.trackerService = new TrackerService(this.configManager, this.licenseManager);
+        this.trackerService = new TrackerService(this.configManager, this.licenseManager, this.bountyManager);
         this.announcer = new BountyAnnouncer(this.storage, this.licenseManager);
         this.damageTracker = new DamageTracker(this.storage, this.configManager);
         this.collusionDetector = new CollusionDetector(this.storage, this.configManager);
