@@ -18,7 +18,7 @@ Player bounties, licensed bounty hunters, and economic anti-exploit enforcement 
 ## Why server owners pick Solidus Enforcer
 
 - **Consequences for griefing** — a bounty system your players actually fund themselves; the server pays nothing.
-- **A economy sink that fights inflation** — the blood tax burns part of every kill's loot instead of recycling it.
+- **An economy sink that fights inflation** — the blood tax burns part of every kill's loot instead of recycling it.
 - **Anti-fraud built in** — kill-trading and collusion rings get detected and their payouts get denied automatically.
 - **Purely server-side** — damage and death are monitored server-side; players install nothing.
 
