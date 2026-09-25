@@ -54,8 +54,7 @@
     "max_same_pair_kills": 3,
     "max_mutual_swaps": 2,
     "transaction_lookback_days": 30,
-    "max_mutual_transactions": 5,
-    "same_claim_penalty": true
+    "max_mutual_transactions": 5
   },
   "compass": {
     "update_interval_ticks": 1200,

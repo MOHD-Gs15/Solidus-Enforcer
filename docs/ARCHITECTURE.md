@@ -20,6 +20,7 @@
 11. [Integration With Solidus Core](#11-integration-with-solidus-core)
 12. [Defects Fixed In 2.1.1](#12-defects-fixed-in-211-security-audit-round-1)
 13. [Defects Fixed In v1.1](#13-defects-fixed-in-v11)
+14. [Defects Fixed In 2.1.1 — Reliability Round](#14-defects-fixed-in-211-reliability-round)
 
 ---
 
@@ -71,29 +72,32 @@ sink, contract decay) to every placement.
 | Operation | Guarantee |
 |---|---|
 | Placing a bounty | One atomic `subtractBalance` (Core-side check+deduct). No pre-check → no TOCTOU. |
-| Insert failure after payment | Automatic `addBalance` refund; failed refunds log CRITICAL. |
-| Blood tax | Split via `EconomyMath.bloodTax`; 100% tax rates refuse to zero out bounties. Treasury leg and burn leg are recorded in one DB transaction each; a failure rolls the whole placement back (bounty cancelled while still unclaimed + placer refunded). |
+| Insert failure after payment | Automatic refund (online, or offline bridge when the placer disconnected mid-chain); failed refunds log CRITICAL. |
+| Blood tax | Split via `EconomyMath.bloodTax`; 100% tax rates refuse to zero out bounties. Treasury leg AND burn leg land in ONE database transaction (`recordTaxLegs`) — a failure leaves both unapplied, so the placement rollback (bounty cancelled while still unclaimed + placer refunded) can never strand a committed leg behind. |
 | Burn leg | Raises `total_burned` only — the burn share **never becomes spendable treasury balance** (it left the economy at placement). |
 | Contract fees | Computed + bounty row updated + treasury ledgered **in one transaction** (`applyContractFee`) — a failure changes nothing. |
-| Claim | `claimBountiesForTarget` selects and marks CLAIMED in one task — double kills cannot double-claim. |
-| Total payout failure | `revertClaim` puts bounties back to ACTIVE (compensation transaction). |
-| Partial payout failure | Bounties stay CLAIMED (never re-payable) + CRITICAL log — reverting partially paid bounties would duplicate money. |
+| Claim | `claimBountiesForTarget` selects and marks CLAIMED (+ `settlement_pending`) in one task — double kills cannot double-claim, and an interrupted settlement is reported at the next startup. |
+| Total payout failure | `revertClaim` puts bounties back to ACTIVE (compensation transaction, flag cleared). |
+| Partial payout failure | Bounties stay CLAIMED (never re-payable) + CRITICAL log + startup stuck-settlement report — reverting partially paid bounties would duplicate money. |
 | Confiscation (admin / collusion) | `confiscateBounties`: status CAS + ledger + treasury credit in one transaction — races and double-cancels change nothing. |
-| Expiry | Rows are marked EXPIRED + `refund_pending`; each refund is claimed in the DB before the money is attempted, so a crash only postpones un-attempted refunds (retried every cycle and at startup). |
+| Value-drop partial payout | The unpaid remainder is confiscated to the treasury under the PENALTY ledger category — it never evaporates. |
+| Expiry | Rows are marked EXPIRED + `refund_pending`; each refund is claimed in the DB before the money is attempted, so a crash only postpones un-attempted refunds (retried every cycle and at startup). Autonomous bounties expire too — their escrow returns to the treasury via AUTO_REFUND, never to a player. |
 | Autonomous funding | `tryFundAutonomousBounty` reads balance and deducts in one task + one transaction; insert failure rolls funding back through AUTO_REFUND (balance restored, paid stat rolled back). |
 | Every treasury movement | Ledger row + treasury row applied in ONE transaction, appended to `treasury_ledger` with category + note; failures complete exceptionally (fail-loud) so callers compensate. |
 
 ## 4. The Bounty Lifecycle
 
 ```
-ACTIVE ──kill──► CLAIMED ──paid──► (final)
+ACTIVE ──kill──► CLAIMED ──paid──► (final; settlement_pending cleared)
    │                │
    │                └─payment failed──► ACTIVE (revert)
    ├──admin cancel──► CANCELLED (confiscated to treasury)
    ├──collusion─────► CANCELLED (confiscated) + public denial notice
    └──duration end──► EXPIRED ──► refund placer (offline bridge)
+                              └─► autonomous: AUTO_REFUND back to treasury
 
-AUTONOMOUS is a placement flag (status 4) — claimable exactly like ACTIVE.
+AUTONOMOUS is a placement flag (status 4) — claimable exactly like ACTIVE,
+and now expires like any other live bounty (escrow returns to the treasury).
 ```
 
 Placer pays `amount`; blood tax `t` splits into treasury share and burn
@@ -109,12 +113,15 @@ share; the hunter fights over `amount − t`. Daily contract fees decay
 2. `KillProcessor.processKill` claims all payable bounties atomically.
 3. Collusion verdict → value-drop ratio → payable = total × ratio.
 4. `EconomyMath.allianceSplit` divides payable into damage pool +
-   finishing pool; `EconomyMath.damageShares` distributes the pool by
-   contribution with last-cent rounding absorbed by the top contributor.
+   finishing pool; `EconomyMath.payoutMap` distributes the pool by
+   contribution with last-cent rounding absorbed by the top contributor —
+   and when no assists are recorded (a one-shot kill whose final-blow row
+     lost the recording race), the killer takes the damage pool too.
 5. Online recipients are paid via `addBalance`; offline via
    `addBalanceOffline` using the attacker name recorded in damage rows.
-6. All paid → stats recorded, damage cleared, public announcement with
-   breakdown. Any failure → `revertClaim` + error log.
+6. All paid → value-drop remainder confiscated to the treasury (PENALTY),
+   settlement flags cleared, stats recorded, damage cleared, public
+   announcement with breakdown. Any failure → `revertClaim` + error log.
 
 ## 6. Anti-Exploit & Collusion
 
@@ -170,7 +177,7 @@ if the DB write fails after payment.
 
 | Table | Purpose |
 |---|---|
-| `bounties` | bounty rows with tax/fee accounting and status lifecycle |
+| `bounties` | bounty rows with tax/fee accounting, status lifecycle, `refund_pending` + `settlement_pending` recovery flags |
 | `hunter_licenses` | license per player (tier, expiry, active flag) |
 | `damage_records` | per-hit damage (+ attacker name), cleaned on schedule |
 | `treasury` | single-row balance + totals |
@@ -180,7 +187,8 @@ if the DB write fails after payment.
 | `collusion_flags` | persisted detection events |
 
 Migrations are handled by `PRAGMA table_info` checks (e.g. v1.0 → v1.1 adds
-`damage_records.attacker_name` in place).
+`damage_records.attacker_name` in place; the reliability round adds
+`bounties.settlement_pending`).
 
 ## 10. Thread Model
 
@@ -192,7 +200,8 @@ Migrations are handled by `PRAGMA table_info` checks (e.g. v1.0 → v1.1 adds
 | Core executors | balance mutations (owned by Solidus Core) |
 
 The tick thread never waits on a future. Startup blocks once for storage
-init (10 s timeout) — on timeout the mod disables itself cleanly.
+init and once for the treasury load (both 10 s timeout) — on timeout the
+mod disables itself cleanly.
 
 ## 11. Integration With Solidus Core
 
@@ -201,8 +210,9 @@ Reflection bridge, zero compile dependency:
 * cached `Method` handles for balance ops, top balances, transaction log,
   shop sections;
 * `SolidusAPI.getInstance()` re-resolved per call so late Core init works;
-* shop sell-prices cached (30 min TTL) — the kill pipeline never does
-  reflection per item;
+* shop sell-prices cached (30 min TTL, stale-while-revalidate with an
+  async single-flight refresh; warmed at server start) — the kill pipeline
+  never does reflection per item and never on the server thread;
 * absent Core ⇒ `isAvailable() == false` ⇒ every economy path refuses with
   a clear message.
 
@@ -244,3 +254,33 @@ Reflection bridge, zero compile dependency:
 | 14 | Admin cancel unexposed; no admin tooling | full `/enforcer` command set |
 | 15 | Silent mixin failures (`defaultRequire: 0`) | `required: true`, `defaultRequire: 1` |
 | 16 | `BalanceEntryData.uuid` always null | honest 2-field record + documented resolution path |
+
+## 14. Defects Fixed In 2.1.1 — Reliability Round
+
+Same dimensions as the solidus-core 2.2.6 and Governance audits. Full
+report with rationale: [docs/AUDIT_REPORT.md](AUDIT_REPORT.md).
+
+| # | Defect | Fix |
+|---|---|---|
+| ENF-01 | Blood-tax legs were two transactions — a partial failure stranded the committed treasury leg behind a full placer refund, minting money (CRITICAL) | `recordTaxLegs`: both legs in ONE transaction; the rollback is finally as safe as its log claims |
+| ENF-02 | One-shot kills paid the killer only the finishing pool — 70% of the pot evaporated when the contribution read lost the final-blow recording race | `EconomyMath.payoutMap`: no assists → killer takes the damage pool too |
+| ENF-03 | Value-drop partial payouts silently destroyed the unpaid remainder | Remainder confiscated to the treasury under the PENALTY category (ledgered) |
+| ENF-04 | Autonomous bounties never expired — treasury escrow locked forever, de-dup blocked re-placement | Autonomous rows expire; escrow returns via AUTO_REFUND |
+| ENF-05 | A crash between claim and settle was invisible at the next startup | `settlement_pending` flag + CRITICAL startup reconciliation report |
+| ENF-06 | Unbounded `loadTreasury().join()` could hang server startup | Same 10 s `orTimeout` + fail-closed disable as initialize |
+| ENF-07 | Refunds failed for players who disconnected mid-chain | Online/offline resolution like hunter payouts |
+| ENF-08 | `/bounty place` rejection sent from the storage thread | Server-thread hop |
+| ENF-09 | Autonomous announcements walked the live player list off-thread | Server-thread hop |
+| ENF-10 | Cold shop cache floored the first kill's payout; TTL refresh ran reflection on the tick thread | Async warm-up at start + stale-while-revalidate single-flight refresh |
+| ENF-11 | `/hunter track` cooldown was check-then-act across async hops | Atomic `compute` consume right before issuing the compass |
+| ENF-12 | Mutual-swap scan loaded 24 h of kill events for a 60-minute window | Window cutoff in SQL |
+| ENF-13 | Expiration-cycle exceptions vanished silently | Terminal `.exceptionally` logger |
+| ENF-14 | Failed refunds were counted as refunded | Count successes only |
+
+Documented/accepted: ENF-15 dead config key removed from defaults (getter
+kept for API stability), ENF-16 `PAYOUT` category unreachable / paid-stat is
+autonomous-only, ENF-17/18 theoretical overlapping-cycle double-credit,
+ENF-19 final-blow recording order (mitigated by ENF-02), ENF-20 bounded
+N+1 refund scan, ENF-21 inventory slot mapping verified correct against
+bytecode, ENF-22 bounded static cooldown map, ENF-23 bounded shutdown
+close race.

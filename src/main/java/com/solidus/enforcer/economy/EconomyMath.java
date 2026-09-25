@@ -129,6 +129,29 @@ public final class EconomyMath {
     }
 
     /**
+     * Final payout map for a claim: the damage pool split across contributors
+     * (weighted) plus the finishing pool for the killer.
+     *
+     * <p>When NO damage contributions are recorded — a one-shot kill whose
+     * final-blow row lost the race with the contribution read (the death mixin
+     * fires at {@code die()} HEAD, before the final hit is recorded at
+     * {@code hurtServer} RETURN) — the killer takes the damage pool too.
+     * Without this, 70% of a solo pot would silently evaporate (ENF-02).
+     *
+     * @param damageByAttacker positive damage sums per attacker (may be empty)
+     * @param killerUuid       the finishing killer (always receives the finishing pool)
+     */
+    public static java.util.LinkedHashMap<java.util.UUID, Double> payoutMap(
+            java.util.Map<java.util.UUID, Double> damageByAttacker, java.util.UUID killerUuid, PayoutSplit split) {
+        java.util.LinkedHashMap<java.util.UUID, Double> payouts = damageShares(damageByAttacker, split.damagePool());
+        if (payouts.isEmpty() && split.damagePool() > 0.0) {
+            payouts.put(killerUuid, split.damagePool());
+        }
+        payouts.merge(killerUuid, split.finishingPool(), Double::sum);
+        return payouts;
+    }
+
+    /**
      * Value-drop payout: full pay when carried gear meets the required value,
      * otherwise linearly reduced down to the naked penalty floor.
      *

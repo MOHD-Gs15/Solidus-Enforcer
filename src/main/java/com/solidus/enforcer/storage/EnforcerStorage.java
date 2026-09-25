@@ -213,6 +213,10 @@ public final class EnforcerStorage {
             // 2.1.1: expiry refund recovery — rows are claimed before their refund is
             // attempted so a crash can never strand a refund forever (E-7).
             this.addColumnIfMissing(stmt, "bounties", "refund_pending", "INTEGER NOT NULL DEFAULT 0");
+            // 2.1.2 (reliability round, ENF-05): set at claim, cleared at every
+            // terminal outcome (settled / reverted / confiscated). Rows still flagged
+            // at startup are interrupted settlements — reported loudly, never retried.
+            this.addColumnIfMissing(stmt, "bounties", "settlement_pending", "INTEGER NOT NULL DEFAULT 0");
         }
     }
 
@@ -339,6 +343,9 @@ public final class EnforcerStorage {
      * Runs as ONE worker task (SELECT + UPDATE back-to-back on the single
      * storage thread), so two simultaneous kills can never both observe the
      * bounties as ACTIVE — the first claim wins, the second sees an empty set.
+     * The claim also raises {@code settlement_pending} (ENF-05): the flag is
+     * cleared by every terminal outcome (settled / reverted / confiscated) and
+     * anything still flagged at the next startup is an interrupted settlement.
      */
     public CompletableFuture<List<BountyEntry>> claimBountiesForTarget(UUID targetUuid) {
         return this.supply(() -> {
@@ -355,7 +362,7 @@ public final class EnforcerStorage {
                 return List.of();
             }
             try (PreparedStatement ps = this.connection.prepareStatement(
-                    "UPDATE bounties SET status = ? WHERE target_uuid = ? AND " + ACTIVE_FILTER)) {
+                    "UPDATE bounties SET status = ?, settlement_pending = 1 WHERE target_uuid = ? AND " + ACTIVE_FILTER)) {
                 ps.setInt(1, BountyStatus.CLAIMED.getCode());
                 ps.setString(2, targetUuid.toString());
                 ps.executeUpdate();
@@ -373,7 +380,7 @@ public final class EnforcerStorage {
             if (bountyIds == null || bountyIds.isEmpty()) {
                 return;
             }
-            StringBuilder sql = new StringBuilder("UPDATE bounties SET status = ? WHERE id IN (");
+            StringBuilder sql = new StringBuilder("UPDATE bounties SET status = ?, settlement_pending = 0 WHERE id IN (");
             for (int i = 0; i < bountyIds.size(); i++) {
                 sql.append(i == 0 ? "?" : ", ?");
             }
@@ -427,7 +434,7 @@ public final class EnforcerStorage {
                 try {
                     int changed = 0;
                     try (PreparedStatement ps = this.connection.prepareStatement(
-                            "UPDATE bounties SET status = ? WHERE id = ? AND status IN (" + codes + ")")) {
+                            "UPDATE bounties SET status = ?, settlement_pending = 0 WHERE id = ? AND status IN (" + codes + ")")) {
                         ps.setInt(1, BountyStatus.CANCELLED.getCode());
                         for (int id : bountyIds) {
                             ps.setInt(2, id);
@@ -450,6 +457,101 @@ public final class EnforcerStorage {
                 this.quietRollback();
                 return null;
             }
+        });
+    }
+
+    /**
+     * Ends the settlement of fully-paid bounties: clears {@code settlement_pending}
+     * while the rows stay CLAIMED (the terminal, paid state). Called from
+     * {@code KillProcessor.finalizeSettlement} after every payment succeeded.
+     */
+    public CompletableFuture<Void> clearSettlementPending(List<Integer> bountyIds) {
+        return this.run(() -> {
+            if (bountyIds == null || bountyIds.isEmpty()) {
+                return;
+            }
+            StringBuilder sql = new StringBuilder("UPDATE bounties SET settlement_pending = 0 WHERE status = ? AND id IN (");
+            for (int i = 0; i < bountyIds.size(); i++) {
+                sql.append(i == 0 ? "?" : ", ?");
+            }
+            sql.append(')');
+            try (PreparedStatement ps = this.connection.prepareStatement(sql.toString())) {
+                ps.setInt(1, BountyStatus.CLAIMED.getCode());
+                for (int i = 0; i < bountyIds.size(); i++) {
+                    ps.setInt(2 + i, bountyIds.get(i));
+                }
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                LOGGER.error("Failed to clear settlement flags {}", bountyIds, e);
+            }
+        });
+    }
+
+    /** A bounty whose settlement was interrupted before reaching a terminal state. */
+    public record StuckSettlement(int id, String targetName, double totalAmount) {
+    }
+
+    /**
+     * Settlements still flagged from previous runs — a crash (or a partial
+     * payout) between claim and settle. Payment state is unknowable after the
+     * fact, so these are NEVER retried automatically (prefer-loss-over-
+     * double-pay); callers report them for manual reconciliation.
+     */
+    public CompletableFuture<List<StuckSettlement>> findStuckSettlements() {
+        return this.supply(() -> {
+            List<StuckSettlement> stuck = new ArrayList<>();
+            String sql = "SELECT id, target_name, total_amount FROM bounties WHERE status = ? AND settlement_pending = 1";
+            try (PreparedStatement ps = this.connection.prepareStatement(sql)) {
+                ps.setInt(1, BountyStatus.CLAIMED.getCode());
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        stuck.add(new StuckSettlement(rs.getInt("id"), rs.getString("target_name"), rs.getDouble("total_amount")));
+                    }
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed to scan for stuck settlements", e);
+            }
+            return stuck;
+        });
+    }
+
+    /**
+     * Atomic blood-tax recording: the treasury leg AND the burn leg land in
+     * ONE database transaction (two ledger rows + the treasury row updates
+     * together — ENF-01). A failure leaves BOTH unapplied, so the placement
+     * rollback (cancel + refund) can never strand a committed tax leg behind —
+     * the two-transaction version could mint money when only the first leg
+     * committed.
+     */
+    public CompletableFuture<TreasuryManager.TreasurySnapshot> recordTaxLegs(
+            double treasuryAmount, double burnAmount, String note) {
+        return this.supply(() -> {
+            boolean hasTreasury = Double.isFinite(treasuryAmount) && treasuryAmount > 0.0;
+            boolean hasBurn = Double.isFinite(burnAmount) && burnAmount > 0.0;
+            if (!hasTreasury && !hasBurn) {
+                return this.readTreasury();
+            }
+            try {
+                this.connection.setAutoCommit(false);
+                try {
+                    if (hasTreasury) {
+                        this.insertLedgerRow(TreasuryManager.Category.TAX, treasuryAmount, note);
+                        this.applyTreasuryRow(TreasuryManager.Category.TAX, treasuryAmount);
+                    }
+                    if (hasBurn) {
+                        this.insertLedgerRow(TreasuryManager.Category.BURN, burnAmount, note);
+                        this.applyTreasuryRow(TreasuryManager.Category.BURN, burnAmount);
+                    }
+                    this.connection.commit();
+                } finally {
+                    this.connection.setAutoCommit(true);
+                }
+            } catch (SQLException e) {
+                LOGGER.error("Failed tax legs ({}, {}) — rolled back", treasuryAmount, burnAmount, e);
+                this.quietRollback();
+                throw new IllegalStateException("Tax leg recording failed", e);
+            }
+            return this.readTreasury();
         });
     }
 
@@ -519,12 +621,16 @@ public final class EnforcerStorage {
      * Expires overdue bounties (marking them refund-pending in the same task) and
      * returns them so the caller can refund placers. The pending flag lets
      * {@link #claimNextRefundPending()} retry refunds a crash may have stranded.
+     *
+     * <p>Autonomous bounties expire too (ENF-04): their escrowed funds return to
+     * the treasury through the AUTO_REFUND leg instead of a player refund, so
+     * the treasury can never be locked in a bounty nobody claims forever.
      */
     public CompletableFuture<List<BountyEntry>> expireOldBounties() {
         return this.supply(() -> {
             List<BountyEntry> toExpire = new ArrayList<>();
             try (PreparedStatement ps = this.connection.prepareStatement(
-                    "SELECT * FROM bounties WHERE " + ACTIVE_FILTER + " AND expire_timestamp < ? AND autonomous = 0")) {
+                    "SELECT * FROM bounties WHERE " + ACTIVE_FILTER + " AND expire_timestamp < ?")) {
                 ps.setLong(1, System.currentTimeMillis());
                 toExpire = this.mapAll(ps);
             } catch (SQLException e) {
@@ -718,6 +824,10 @@ public final class EnforcerStorage {
         switch (category) {
             case BURN -> this.updateTreasuryRow(
                     "UPDATE treasury SET total_burned = total_burned + ? WHERE id = 1", amount);
+            // PENALTY (ENF-03): credited to the spendable balance only — it is not a
+            // tax, so it must not inflate the "Total Tax Collected" stat.
+            case PENALTY -> this.updateTreasuryRow(
+                    "UPDATE treasury SET balance = balance + ? WHERE id = 1", amount);
             case PAYOUT, AUTO_FUND -> this.updateTreasuryRow(
                     "UPDATE treasury SET balance = balance - ?, total_paid_bounties = total_paid_bounties + ? WHERE id = 1",
                     amount, amount);
@@ -1087,35 +1197,32 @@ public final class EnforcerStorage {
     public CompletableFuture<Integer> countMutualSwaps(UUID a, UUID b, long windowMs) {
         return this.supply(() -> {
             // Count direction reversals (A->B followed by B->A or vice versa) inside the window.
+            // The window cutoff is applied IN SQL (ENF-12) so a 24h kill-event table is
+            // not pulled into memory just to be filtered down to a 60-minute window.
             String sql = """
-                    SELECT killer_uuid, victim_uuid, timestamp FROM kill_events
-                    WHERE (killer_uuid = ? AND victim_uuid = ?) OR (killer_uuid = ? AND victim_uuid = ?)
+                    SELECT killer_uuid, victim_uuid FROM kill_events
+                    WHERE ((killer_uuid = ? AND victim_uuid = ?) OR (killer_uuid = ? AND victim_uuid = ?))
+                      AND timestamp > ?
                     ORDER BY timestamp ASC""";
-            List<long[]> directions = new ArrayList<>();
+            List<Integer> directions = new ArrayList<>();
             try (PreparedStatement ps = this.connection.prepareStatement(sql)) {
                 ps.setString(1, a.toString());
                 ps.setString(2, b.toString());
                 ps.setString(3, b.toString());
                 ps.setString(4, a.toString());
+                ps.setLong(5, System.currentTimeMillis() - windowMs);
                 try (ResultSet rs = ps.executeQuery()) {
                     while (rs.next()) {
-                        directions.add(new long[]{
-                                rs.getString("killer_uuid").equals(a.toString()) ? 0 : 1,
-                                rs.getLong("timestamp")});
+                        directions.add(rs.getString("killer_uuid").equals(a.toString()) ? 0 : 1);
                     }
                 }
             } catch (SQLException e) {
                 LOGGER.error("Failed to read kill events for swaps", e);
                 return 0;
             }
-            long cutoff = System.currentTimeMillis() - windowMs;
             int swaps = 0;
             Integer lastDirection = null;
-            for (long[] row : directions) {
-                if (row[1] < cutoff) {
-                    continue;
-                }
-                int direction = (int) row[0];
+            for (int direction : directions) {
                 if (lastDirection != null && lastDirection != direction) {
                     swaps++;
                 }

@@ -86,16 +86,18 @@ public final class SolidusEnforcerMod implements DedicatedServerModInitializer {
         this.storage = new EnforcerStorage(configDir);
         try {
             this.storage.initialize().orTimeout(10L, TimeUnit.SECONDS).join();
+            // Bounded like initialize (ENF-06): an unbounded join on the server
+            // thread could hang startup forever if the worker stalls mid-read.
+            this.treasury = new TreasuryManager();
+            this.treasury.applySnapshot(this.storage.loadTreasury().orTimeout(10L, TimeUnit.SECONDS).join());
         } catch (Exception e) {
             LOGGER.error("Enforcer storage failed to initialize — Enforcer stays DISABLED this run", e);
             this.storage.shutdown();
             this.storage = null;
             this.configManager = null;
+            this.treasury = null;
             return;
         }
-
-        this.treasury = new TreasuryManager();
-        this.treasury.applySnapshot(this.storage.loadTreasury().join());
 
         this.bountyManager = new BountyManager(this.storage, this.configManager, this.treasury);
         this.licenseManager = new HunterLicenseManager(this.storage, this.configManager);
@@ -115,6 +117,27 @@ public final class SolidusEnforcerMod implements DedicatedServerModInitializer {
             LOGGER.warn("Solidus Core not detected — economy features are DISABLED (fail-closed). "
                     + "Bounties, licenses and payouts will refuse to run until Core is installed.");
         }
+        // ENF-10: warm the shop price cache BEFORE the first kill so the first
+        // death-time valuation does not read an empty table (which floored every
+        // payout at the naked-penalty minimum) and does no reflection on the
+        // server thread.
+        if (coreAvailable) {
+            SolidusBridge.warmShopPriceCacheAsync();
+        }
+        // ENF-05: interrupted settlements from previous runs — reported loudly,
+        // never retried automatically (payment state is unknowable; reverting
+        // could double-pay, completing could pay twice).
+        this.storage.findStuckSettlements().thenAccept(stuck -> {
+            if (!stuck.isEmpty()) {
+                LOGGER.error("CRITICAL: {} bounty settlement(s) from a previous run were interrupted mid-payout "
+                                + "and stay CLAIMED with their money in escrow — manual reconciliation required "
+                                + "(prefer-loss-over-double-pay): {}",
+                        stuck.size(), stuck);
+            }
+        }).exceptionally(error -> {
+            LOGGER.error("Stuck-settlement scan failed", error);
+            return null;
+        });
         this.bountyManager.processExpirations();
         LOGGER.info("Solidus Enforcer fully activated! Solidus Core available: {}", coreAvailable);
     }

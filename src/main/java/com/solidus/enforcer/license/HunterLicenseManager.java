@@ -66,8 +66,16 @@ public final class HunterLicenseManager {
                                 license));
                     }
                     LOGGER.error("License save failed after payment — attempting refund for {}", name);
-                    return SolidusBridge.addBalance(player, cost).handle((refund, refundError) -> {
-                        if (refundError != null || refund == null || refund < 0.0) {
+                    // ENF-07: the buyer may have disconnected between payment and the
+                    // failed write — refund through the offline bridge when they did,
+                    // exactly like bounty refunds and hunter payouts.
+                    net.minecraft.server.MinecraftServer serverRef = player.level().getServer();
+                    ServerPlayer online = serverRef != null ? serverRef.getPlayerList().getPlayer(uuid) : player;
+                    CompletableFuture<Double> refund = online != null
+                            ? SolidusBridge.addBalance(online, cost)
+                            : SolidusBridge.addBalanceOffline(uuid, name, cost);
+                    return refund.handle((balance, refundError) -> {
+                        if (refundError != null || balance == null || balance < 0.0) {
                             LOGGER.error("REFUND FAILED for {} ({}) — manual intervention required", name, cost);
                             return new PurchaseResult(false,
                                     "License activation failed — CRITICAL: refund failed, contact an admin", null);

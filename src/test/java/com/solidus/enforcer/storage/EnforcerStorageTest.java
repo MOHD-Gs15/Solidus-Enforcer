@@ -184,11 +184,136 @@ class EnforcerStorageTest {
     }
 
     // ------------------------------------------------------------------
+    // Atomic tax legs (ENF-01)
+    // ------------------------------------------------------------------
+
+    @Test
+    void recordTaxLegsAppliesBothLegsInOneOperation() {
+        TreasuryManager.TreasurySnapshot snapshot = this.storage.recordTaxLegs(50.0, 50.0, "tax test").join();
+
+        assertEquals(50.0, snapshot.balance(), "treasury leg becomes spendable balance");
+        assertEquals(50.0, snapshot.totalCollectedTax());
+        assertEquals(50.0, snapshot.totalBurned(), "burn leg raises only the burned stat");
+        assertEquals(0.0, snapshot.totalPaidBounties());
+    }
+
+    @Test
+    void recordTaxLegsWithZeroAmountsChangesNothing() {
+        this.storage.adjustTreasury(TreasuryManager.Category.FEE, 100.0, "seed").join();
+        TreasuryManager.TreasurySnapshot snapshot = this.storage.recordTaxLegs(0.0, 0.0, "no-op").join();
+
+        assertEquals(100.0, snapshot.balance(), "a no-op tax split must not move anything");
+        assertEquals(0.0, snapshot.totalBurned());
+    }
+
+    @Test
+    void recordTaxLegsWithOnlyOneLegStillLandsWhole() {
+        this.storage.recordTaxLegs(0.0, 25.0, "burn-only").join();
+        TreasuryManager.TreasurySnapshot snapshot = this.storage.loadTreasury().join();
+
+        assertEquals(0.0, snapshot.balance(), "burn never becomes spendable balance");
+        assertEquals(25.0, snapshot.totalBurned());
+    }
+
+    // ------------------------------------------------------------------
+    // PENALTY category semantics (ENF-03)
+    // ------------------------------------------------------------------
+
+    @Test
+    void penaltyCreditsBalanceWithoutTouchingTheTaxStat() {
+        this.storage.adjustTreasury(TreasuryManager.Category.PENALTY, 85.5, "value-drop penalty test").join();
+        TreasuryManager.TreasurySnapshot snapshot = this.storage.loadTreasury().join();
+
+        assertEquals(85.5, snapshot.balance(), "the confiscated remainder becomes spendable");
+        assertEquals(0.0, snapshot.totalCollectedTax(), "a penalty is not a tax");
+        assertEquals(0.0, snapshot.totalBurned());
+    }
+
+    // ------------------------------------------------------------------
+    // Settlement-pending lifecycle (ENF-05)
+    // ------------------------------------------------------------------
+
+    @Test
+    void claimMarksSettlementPendingAndRevertClearsIt() throws Exception {
+        UUID victim = UUID.randomUUID();
+        int id = this.insertBountyFor(victim, 600.0, System.currentTimeMillis() + 86_400_000L);
+
+        List<BountyEntry> claimed = this.storage.claimBountiesForTarget(victim).join();
+        assertEquals(1, claimed.size());
+        assertEquals(1, this.storage.findStuckSettlements().join().size(),
+                "a claimed-but-unsettled bounty is a stuck settlement");
+
+        this.storage.revertClaim(claimed.stream().map(BountyEntry::id).toList()).join();
+        assertTrue(this.storage.findStuckSettlements().join().isEmpty(),
+                "a reverted claim is back up for grabs — nothing stuck");
+        assertEquals(BountyStatus.ACTIVE, this.readBountyStatus(id));
+    }
+
+    @Test
+    void settledBountiesKeepClaimedStatusWithoutThePendingFlag() throws Exception {
+        UUID victim = UUID.randomUUID();
+        int id = this.insertBountyFor(victim, 600.0, System.currentTimeMillis() + 86_400_000L);
+
+        List<BountyEntry> claimed = this.storage.claimBountiesForTarget(victim).join();
+        this.storage.clearSettlementPending(claimed.stream().map(BountyEntry::id).toList()).join();
+
+        assertEquals(BountyStatus.CLAIMED, this.readBountyStatus(id), "paid bounties stay CLAIMED");
+        assertTrue(this.storage.findStuckSettlements().join().isEmpty(),
+                "a fully settled bounty is not a stuck settlement");
+    }
+
+    @Test
+    void confiscationClearsTheSettlementFlag() {
+        UUID victim = UUID.randomUUID();
+        this.insertBountyFor(victim, 400.0, System.currentTimeMillis() + 86_400_000L);
+
+        List<BountyEntry> claimed = this.storage.claimBountiesForTarget(victim).join();
+        assertNotNull(this.storage.confiscateBounties(
+                claimed.stream().map(BountyEntry::id).toList(),
+                EnumSet.of(BountyStatus.CLAIMED), 400.0, "collusion test").join());
+        assertTrue(this.storage.findStuckSettlements().join().isEmpty(),
+                "a confiscated claim reached a terminal state");
+    }
+
+    // ------------------------------------------------------------------
+    // Autonomous bounty expiry (ENF-04)
+    // ------------------------------------------------------------------
+
+    @Test
+    void autonomousBountiesExpireRefundPendingLikePlayerBounties() {
+        UUID target = UUID.randomUUID();
+        this.storage.insertBounty(BountyEntry.createAutonomous(target, "Target", 1_000.0,
+                "Rampage: 12 kills", 1)).join();
+        // Force the expiry into the past.
+        try (Connection connection = this.openRaw();
+             Statement statement = connection.createStatement()) {
+            statement.execute("UPDATE bounties SET expire_timestamp = "
+                    + (System.currentTimeMillis() - 1_000L) + " WHERE target_name = 'Target'");
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+
+        List<BountyEntry> expired = this.storage.expireOldBounties().join();
+        assertEquals(1, expired.size(), "autonomous bounties must expire, not sit in escrow forever");
+        assertTrue(expired.get(0).autonomous());
+
+        BountyEntry pending = this.storage.claimNextRefundPending().join();
+        assertNotNull(pending, "the expired autonomous bounty is refund-pending");
+        assertNull(pending.placedByUuid(), "autonomous rows have no player placer");
+    }
+
+    // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 
     private int insertActiveBounty(double amount, long expiry) {
         return this.storage.insertBounty(new BountyEntry(0, UUID.randomUUID(), "Target", amount, amount,
+                0.0, 0.0, UUID.randomUUID(), "Placer", System.currentTimeMillis(),
+                expiry, BountyStatus.ACTIVE, false, null)).join();
+    }
+
+    private int insertBountyFor(UUID targetUuid, double amount, long expiry) {
+        return this.storage.insertBounty(new BountyEntry(0, targetUuid, "Target", amount, amount,
                 0.0, 0.0, UUID.randomUUID(), "Placer", System.currentTimeMillis(),
                 expiry, BountyStatus.ACTIVE, false, null)).join();
     }

@@ -169,6 +169,26 @@ public final class HunterCommand {
 
     private static final Map<UUID, Long> TRACK_COOLDOWNS = new ConcurrentHashMap<>();
 
+    /**
+     * Atomic check-and-consume for the track cooldown (ENF-11): the old
+     * check-then-act spanned the async license/bounty hops, so two rapid
+     * commands could both pass and both issue compasses, and the recorded
+     * timestamp was the stale pre-hop capture.
+     */
+    private static boolean tryConsumeTrackCooldown(UUID hunterUuid, long cooldownMs) {
+        boolean[] granted = {false};
+        TRACK_COOLDOWNS.compute(hunterUuid, (uuid, previous) -> {
+            long now = System.currentTimeMillis();
+            if (previous != null && now - previous < cooldownMs) {
+                granted[0] = false;
+                return previous;
+            }
+            granted[0] = true;
+            return now;
+        });
+        return granted[0];
+    }
+
     private static int executeTrack(CommandContext<CommandSourceStack> ctx, SolidusEnforcerMod mod) throws CommandSyntaxException {
         ServerPlayer hunter = ctx.getSource().getPlayerOrException();
         ServerPlayer target = EntityArgument.getPlayer(ctx, "target");
@@ -192,11 +212,12 @@ public final class HunterCommand {
             }
             LicenseTier tier = licenseOpt.get().tier();
 
-            long now = System.currentTimeMillis();
             long cooldownMs = mod.getConfigManager().getTrackCooldownMinutes() * 60_000L;
+            // Fast UX rejection only — the authoritative check is the atomic
+            // consume right before the compass is issued (ENF-11).
             Long lastTrack = TRACK_COOLDOWNS.get(hunterUuid);
-            if (lastTrack != null && now - lastTrack < cooldownMs) {
-                long remaining = cooldownMs - (now - lastTrack);
+            if (lastTrack != null && System.currentTimeMillis() - lastTrack < cooldownMs) {
+                long remaining = cooldownMs - (System.currentTimeMillis() - lastTrack);
                 ctx.getSource().sendFailure(TextUtil.branded(
                         "Tracking on cooldown — available in " + TextUtil.formatDuration(remaining),
                         TextUtil.COLOR_WARN));
@@ -205,14 +226,20 @@ public final class HunterCommand {
 
             mod.getBountyManager().getTotalBountyForTarget(target.getUUID()).thenAccept(totalBounty ->
                     ctx.getSource().getServer().execute(() -> {
-                        if (totalBounty <= 0.0) {
+                        if (totalBounty == null || totalBounty <= 0.0) {
                             ctx.getSource().sendFailure(TextUtil.branded(
                                     target.getName().getString() + " carries no active bounty — nothing to track",
                                     TextUtil.COLOR_BAD));
                             return;
                         }
+                        // The single authoritative gate: exactly one of two concurrent
+                        // commands reaches issueCompass.
+                        if (!tryConsumeTrackCooldown(hunterUuid, cooldownMs)) {
+                            ctx.getSource().sendFailure(TextUtil.branded(
+                                    "Tracking on cooldown — try again later", TextUtil.COLOR_WARN));
+                            return;
+                        }
                         issueCompass(mod, hunter, target, tier);
-                        TRACK_COOLDOWNS.put(hunterUuid, now);
                     }));
         }));
         return 1;

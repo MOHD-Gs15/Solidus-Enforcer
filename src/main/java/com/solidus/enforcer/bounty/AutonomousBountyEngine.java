@@ -155,7 +155,14 @@ public final class AutonomousBountyEngine {
                                 return;
                             }
                             BountyEntry placed = bounty.withId(id);
-                            this.announcer.announceAutonomousBounty(placed, server);
+                            // ENF-09: the announcement walks the live player list —
+                            // hop it to the server thread instead of iterating it from
+                            // this storage continuation.
+                            try {
+                                server.execute(() -> this.announcer.announceAutonomousBounty(placed, server));
+                            } catch (RuntimeException rejected) {
+                                LOGGER.error("Autonomous bounty announcement skipped (server shutting down?)", rejected);
+                            }
                             LOGGER.info("Autonomous bounty placed: S$ {} on {} — {}", suggested, targetName, reason);
                         });
                     });

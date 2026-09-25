@@ -121,8 +121,10 @@ public final class KillProcessor {
         EconomyMath.PayoutSplit split = EconomyMath.allianceSplit(payable,
                 this.config.getAllianceDamageShare(), this.config.getAllianceFinishingBonus());
 
-        LinkedHashMap<UUID, Double> payouts = EconomyMath.damageShares(contributions, split.damagePool());
-        payouts.merge(killer.getUUID(), split.finishingPool(), Double::sum);
+        // ENF-02: an empty contribution read (one-shot kill whose final-blow row
+        // lost the race with the read) no longer drops the damage pool — the
+        // killer takes it; a solo killer receives the full payable either way.
+        LinkedHashMap<UUID, Double> payouts = EconomyMath.payoutMap(contributions, killer.getUUID(), split);
 
         return this.damageTracker.getAttackerNames(victim.getUUID()).thenCompose(names -> {
             names.putIfAbsent(killer.getUUID(), killer.getName().getString());
@@ -143,8 +145,29 @@ public final class KillProcessor {
                     })
                     .thenCompose(verdict -> {
                         if (verdict.failed() == 0) {
-                            return this.finalizeSettlement(claimed, victim, killer, payouts,
-                                    exploitResult, totalBounty, payable, server);
+                            // ENF-03: the value-drop remainder (the share that was
+                            // never payable to anyone) is confiscated to the treasury
+                            // instead of silently evaporating — the placer paid for it,
+                            // so it must stay visible in the ledger.
+                            double remainder = EconomyMath.round2(totalBounty - payable);
+                            CompletableFuture<Void> penaltyLeg = remainder > 0.0
+                                    ? this.storage.adjustTreasury(
+                                            com.solidus.enforcer.economy.TreasuryManager.Category.PENALTY, remainder,
+                                            "value-drop penalty: bounties "
+                                                    + claimed.stream().map(BountyEntry::id).toList())
+                                            .handle((snapshot, error) -> {
+                                                if (error != null) {
+                                                    LOGGER.error("CRITICAL: value-drop penalty leg failed for "
+                                                            + "bounty settlement ({} S$ stranded — manual reconciliation)",
+                                                            remainder, error);
+                                                } else {
+                                                    this.treasury.applySnapshot(snapshot);
+                                                }
+                                                return (Void) null;
+                                            })
+                                    : CompletableFuture.completedFuture(null);
+                            return penaltyLeg.thenCompose(v -> this.finalizeSettlement(claimed, victim, killer,
+                                    payouts, exploitResult, totalBounty, payable, server));
                         }
                         if (verdict.revertAll()) {
                             // Nothing was paid — safe to put the bounties back up for grabs.
@@ -167,13 +190,24 @@ public final class KillProcessor {
     /**
      * Post-payment bookkeeping. Every stage is exception-safe: a failure here is
      * logged loudly but NEVER reverts the claim — the money has already moved.
+     * Clearing {@code settlement_pending} (ENF-05) is the FIRST stage so a crash
+     * between payment and here still leaves a loud startup report instead of a
+     * silent CLAIMED row.
      */
     private CompletableFuture<Void> finalizeSettlement(List<BountyEntry> claimed, ServerPlayer victim,
                                                         ServerPlayer killer, LinkedHashMap<UUID, Double> payouts,
                                                         AntiExploitEngine.ExploitCheckResult exploitResult,
                                                         double totalBounty, double payable, MinecraftServer server) {
-        return this.storage.recordKill(killer.getUUID(), killer.getName().getString(),
-                        victim.getUUID(), victim.getName().getString())
+        return this.storage.clearSettlementPending(claimed.stream().map(BountyEntry::id).toList())
+                .handle((ignored, error) -> {
+                    if (error != null) {
+                        LOGGER.error("Settlement flag cleanup failed for victim {} (payout already settled — "
+                                + "startup reconciliation will report it)", victim.getUUID(), error);
+                    }
+                    return null;
+                })
+                .thenCompose(v -> this.storage.recordKill(killer.getUUID(), killer.getName().getString(),
+                        victim.getUUID(), victim.getName().getString()))
                 .handle((ignored, error) -> {
                     if (error != null) {
                         LOGGER.error("Kill stats recording failed for victim {} (payout already settled)",

@@ -9,6 +9,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.server.level.ServerPlayer;
 import org.slf4j.Logger;
@@ -296,31 +297,64 @@ public final class SolidusBridge {
         }
     }
 
-    /**
-     * Cached material -> sell-price table built from the live shop config.
+    /** Cached material -> sell-price table built from the live shop config.
      * Returns an empty map when Core is absent. Refreshed at most once per
      * TTL so the kill pipeline never hammers reflection per item.
+     *
+     * <p>ENF-10: stale-while-revalidate — an expired table is refreshed
+     * asynchronously and the stale copy is served meanwhile, so a death-time
+     * valuation never does the reflection walk on the server thread. Only a
+     * truly cold cache (empty, before the startup warm-up lands) falls back to
+     * a synchronous load, bounded by the small shop config size. A cold table
+     * would otherwise value every inventory at zero and floor the first kill's
+     * payout at the naked-penalty minimum.
      */
     public static Map<String, Double> getShopSellPrices() {
+        long now = System.currentTimeMillis();
+        Map<String, Double> cached = shopPriceCache;
+        if (cached.isEmpty()) {
+            return refreshShopPricesSynchronously();
+        }
+        if (now - shopCacheLoadedAtMs >= SHOP_CACHE_TTL_MS) {
+            refreshShopPricesAsync();
+        }
+        return cached;
+    }
+
+    /** Asynchronous warm-up — called at server start (ENF-10). */
+    public static void warmShopPriceCacheAsync() {
+        refreshShopPricesAsync();
+    }
+
+    /** At most one background refresh is ever in flight. */
+    private static final AtomicBoolean REFRESH_IN_FLIGHT = new AtomicBoolean(false);
+
+    private static void refreshShopPricesAsync() {
+        if (REFRESH_IN_FLIGHT.compareAndSet(false, true)) {
+            CompletableFuture.runAsync(() -> {
+                try {
+                    refreshShopPricesSynchronously();
+                } finally {
+                    REFRESH_IN_FLIGHT.set(false);
+                }
+            });
+        }
+    }
+
+    private static synchronized Map<String, Double> refreshShopPricesSynchronously() {
         long now = System.currentTimeMillis();
         Map<String, Double> cached = shopPriceCache;
         if (!cached.isEmpty() && now - shopCacheLoadedAtMs < SHOP_CACHE_TTL_MS) {
             return cached;
         }
-        synchronized (SolidusBridge.class) {
-            cached = shopPriceCache;
-            if (!cached.isEmpty() && now - shopCacheLoadedAtMs < SHOP_CACHE_TTL_MS) {
-                return cached;
-            }
-            Map<String, Double> fresh = loadShopPrices();
-            if (!fresh.isEmpty()) {
-                shopPriceCache = fresh;
-                shopCacheLoadedAtMs = now;
-                LOGGER.info("Refreshed Enforcer shop price cache ({} items)", fresh.size());
-                return fresh;
-            }
-            return cached;
+        Map<String, Double> fresh = loadShopPrices();
+        if (!fresh.isEmpty()) {
+            shopPriceCache = fresh;
+            shopCacheLoadedAtMs = now;
+            LOGGER.info("Refreshed Enforcer shop price cache ({} items)", fresh.size());
+            return fresh;
         }
+        return cached;
     }
 
     private static Map<String, Double> loadShopPrices() {

@@ -19,6 +19,8 @@ public final class TreasuryManager {
         BURN("money burn"),
         FEE("contract fee"),
         CONFISCATION("confiscation"),
+        /** Value-drop penalty share of a partially paid bounty (ENF-03). */
+        PENALTY("value-drop penalty"),
         AUTO_FUND("autonomous funding"),
         AUTO_REFUND("autonomous refund"),
         PAYOUT("bounty payout");

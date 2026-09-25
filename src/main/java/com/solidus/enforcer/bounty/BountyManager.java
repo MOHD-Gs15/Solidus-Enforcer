@@ -138,35 +138,44 @@ public final class BountyManager {
         });
     }
 
+    /**
+     * Refund that survives a mid-chain disconnect (ENF-07): the player may log
+     * out between payment and refund — the offline bridge credits the account by
+     * UUID+name, exactly like hunter payouts do. A failed refund still fails loud.
+     */
     private CompletableFuture<BountyResult> refundAndFail(ServerPlayer placer, double amount, String message) {
-        return SolidusBridge.addBalance(placer, amount).handle((refund, error) -> {
+        UUID placerUuid = placer.getUUID();
+        String placerName = placer.getName().getString();
+        return refundBalance(placer, placerUuid, placerName, amount).handle((refund, error) -> {
             if (error != null || refund == null || refund < 0.0) {
-                LOGGER.error("REFUND FAILED for {} ({} S$) — manual intervention required", placer.getName().getString(), amount);
+                LOGGER.error("REFUND FAILED for {} ({} S$) — manual intervention required", placerName, amount);
                 return BountyResult.fail(message + " — CRITICAL: refund failed, contact an admin");
             }
             return BountyResult.fail(message);
         });
     }
 
+    /** Online when still connected, the offline bridge otherwise. */
+    private static CompletableFuture<Double> refundBalance(ServerPlayer placer, UUID placerUuid,
+                                                            String placerName, double amount) {
+        net.minecraft.server.MinecraftServer server = placer.level().getServer();
+        ServerPlayer online = server != null ? server.getPlayerList().getPlayer(placerUuid) : placer;
+        return online != null
+                ? SolidusBridge.addBalance(online, amount)
+                : SolidusBridge.addBalanceOffline(placerUuid, placerName, amount);
+    }
+
     /**
-     * Records the blood-tax legs. Both movements are transactional and fail-loud
-     * (an exception propagates to the caller, which rolls the placement back);
-     * the treasury mirror is refreshed from the returned DB snapshots only.
+     * Records the blood-tax legs. Both movements land in ONE database transaction
+     * (ENF-01) and fail loud — an exception propagates to the caller, which rolls
+     * the placement back knowing NOTHING was half-committed; the treasury mirror
+     * is refreshed from the returned DB snapshot only. The two-transaction
+     * version could commit the treasury leg, strand it after a rollback, and
+     * mint money.
      */
     private CompletableFuture<Void> recordTaxMoves(EconomyMath.TaxSplit tax, String note) {
-        CompletableFuture<TreasuryManager.TreasurySnapshot> treasuryMove =
-                tax.treasuryAmount() > 0.0
-                        ? this.storage.adjustTreasury(TreasuryManager.Category.TAX, tax.treasuryAmount(), note)
-                        : CompletableFuture.completedFuture(this.treasury.snapshot());
-        CompletableFuture<TreasuryManager.TreasurySnapshot> burnMove =
-                tax.burnAmount() > 0.0
-                        ? this.storage.adjustTreasury(TreasuryManager.Category.BURN, tax.burnAmount(), note)
-                        : CompletableFuture.completedFuture(this.treasury.snapshot());
-        return CompletableFuture.allOf(treasuryMove, burnMove)
-                .thenRun(() -> {
-                    treasuryMove.thenAccept(this.treasury::applySnapshot);
-                    burnMove.thenAccept(this.treasury::applySnapshot);
-                });
+        return this.storage.recordTaxLegs(tax.treasuryAmount(), tax.burnAmount(), note)
+                .thenAccept(this.treasury::applySnapshot);
     }
 
     // ------------------------------------------------------------------
@@ -216,11 +225,18 @@ public final class BountyManager {
      * is attempted (prefer-loss-over-double-pay), so a crash mid-loop only
      * postpones the not-yet-attempted refunds — they are retried on the next
      * cycle and at startup. Failed refund attempts are logged with the bounty
-     * id for manual recovery instead of vanishing silently.
+     * id for manual recovery instead of vanishing silently. Autonomous bounties
+     * (ENF-04) return their escrow to the treasury via AUTO_REFUND instead.
      */
     public CompletableFuture<Integer> processExpirations() {
         return this.storage.expireOldBounties()
-                .thenCompose(expired -> this.refundPending(0));
+                .thenCompose(expired -> this.refundPending(0))
+                .exceptionally(error -> {
+                    // Fire-and-forget callers (startup, tick bucket) must not lose
+                    // exceptional failures into the void (ENF-13).
+                    LOGGER.error("Bounty expiration cycle failed — pending refunds retry next cycle", error);
+                    return 0;
+                });
     }
 
     /** Recursive per-row claim-and-refund loop (crash-safe, see processExpirations). */
@@ -230,7 +246,24 @@ public final class BountyManager {
                 return CompletableFuture.completedFuture(refunded);
             }
             if (bounty.placedByUuid() == null) {
-                return this.refundPending(refunded);
+                // Autonomous expiry (ENF-04): the treasury funded this bounty —
+                // the escrow returns to the treasury, never to a player. Failures
+                // are logged for manual reconciliation (the flag is already
+                // cleared, so the loss is preferred over a double refund).
+                return this.storage.adjustTreasury(TreasuryManager.Category.AUTO_REFUND,
+                                bounty.totalAmount(), "autonomous bounty #" + bounty.id() + " expired")
+                        .handle((snapshot, error) -> {
+                            if (error != null) {
+                                LOGGER.error("CRITICAL: autonomous expiry refund failed for bounty #{} ({} S$) "
+                                        + "— manual reconciliation required", bounty.id(), bounty.totalAmount(), error);
+                                return false;
+                            }
+                            this.treasury.applySnapshot(snapshot);
+                            LOGGER.info("Autonomous bounty #{} expired — {} S$ returned to the treasury",
+                                    bounty.id(), bounty.totalAmount());
+                            return true;
+                        })
+                        .thenCompose(paid -> this.refundPending(paid ? refunded + 1 : refunded));
             }
             return SolidusBridge.addBalanceOffline(
                             bounty.placedByUuid(), bounty.placedByName(), bounty.totalAmount())
@@ -238,13 +271,14 @@ public final class BountyManager {
                         if (error != null || balance == null || balance < 0.0) {
                             LOGGER.error("Expiry refund FAILED for bounty #{} ({} to {}) — manual recovery needed",
                                     bounty.id(), bounty.totalAmount(), bounty.placedByName(), error);
-                        } else {
-                            LOGGER.info("Expiry refund paid: bounty #{} -> {} ({})", bounty.id(),
-                                    bounty.placedByName(), bounty.totalAmount());
+                            return false;
                         }
-                        return null;
+                        LOGGER.info("Expiry refund paid: bounty #{} -> {} ({})", bounty.id(),
+                                bounty.placedByName(), bounty.totalAmount());
+                        return true;
                     })
-                    .thenCompose(v -> this.refundPending(refunded + 1));
+                    // Only successful refunds are counted (ENF-14).
+                    .thenCompose(paid -> this.refundPending(paid ? refunded + 1 : refunded));
         });
     }
 

@@ -72,8 +72,10 @@ public final class BountyCommand {
 
         licenseManager.hasActiveLicense(placer.getUUID()).thenAccept(licensed -> {
             if (!licensed) {
-                ctx.getSource().sendFailure(TextUtil.branded(
-                        "You need a Hunter License to place bounties — /hunter tiers", TextUtil.COLOR_BAD));
+                // ENF-08: command feedback is marshalled back to the server thread —
+                // this continuation runs on the storage worker.
+                ctx.getSource().getServer().execute(() -> ctx.getSource().sendFailure(TextUtil.branded(
+                        "You need a Hunter License to place bounties — /hunter tiers", TextUtil.COLOR_BAD)));
                 return;
             }
             bountyManager.placeBounty(placer, target, amount).thenAccept(result ->

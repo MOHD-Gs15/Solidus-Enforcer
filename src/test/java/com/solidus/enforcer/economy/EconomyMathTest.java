@@ -123,6 +123,53 @@ class EconomyMathTest {
     }
 
     // ------------------------------------------------------------------
+    // Final payout map (ENF-02)
+    // ------------------------------------------------------------------
+
+    @Test
+    void payoutMapWithNoContributorsGivesKillerTheWholePot() {
+        // One-shot kill whose final-blow row lost the race with the contribution
+        // read: the killer must receive the full payable — dropping the damage
+        // pool here used to evaporate 70% of a solo bounty.
+        UUID killer = UUID.randomUUID();
+        EconomyMath.PayoutSplit split = EconomyMath.allianceSplit(1_000.0, 0.70, 0.30);
+
+        LinkedHashMap<UUID, Double> payouts = EconomyMath.payoutMap(Map.of(), killer, split);
+
+        assertEquals(1, payouts.size());
+        assertEquals(1_000.0, payouts.get(killer), 1e-9);
+    }
+
+    @Test
+    void payoutMapSplitsDamageAndAwardsFinishingBonus() {
+        UUID killer = UUID.randomUUID();
+        UUID ally = UUID.randomUUID();
+        Map<UUID, Double> damage = new LinkedHashMap<>();
+        damage.put(killer, 300.0);
+        damage.put(ally, 100.0);
+        EconomyMath.PayoutSplit split = EconomyMath.allianceSplit(1_000.0, 0.70, 0.30);
+
+        LinkedHashMap<UUID, Double> payouts = EconomyMath.payoutMap(damage, killer, split);
+
+        double total = payouts.values().stream().mapToDouble(Double::doubleValue).sum();
+        assertEquals(1_000.0, total, 0.02, "the whole pot is distributed");
+        assertEquals(175.0, payouts.get(ally), 0.02, "ally's weighted damage share (700 × 100/400)");
+        assertEquals((700.0 * 0.75) + 300.0, payouts.get(killer), 0.02,
+                "killer: weighted share + finishing bonus");
+    }
+
+    @Test
+    void payoutMapSoloAttackerReceivesEverything() {
+        UUID killer = UUID.randomUUID();
+        EconomyMath.PayoutSplit split = EconomyMath.allianceSplit(500.0, 0.70, 0.30);
+
+        LinkedHashMap<UUID, Double> payouts = EconomyMath.payoutMap(Map.of(killer, 20.0), killer, split);
+
+        assertEquals(1, payouts.size());
+        assertEquals(500.0, payouts.get(killer), 0.01);
+    }
+
+    // ------------------------------------------------------------------
     // Value-drop payout
     // ------------------------------------------------------------------
 
