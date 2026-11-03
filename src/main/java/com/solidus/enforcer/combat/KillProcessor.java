@@ -75,6 +75,12 @@ public final class KillProcessor {
      * @param inventorySnapshot gear value captured synchronously at death time
      */
     public void processKill(ServerPlayer victim, ServerPlayer killer, double inventorySnapshot, MinecraftServer server) {
+        // C-2ج fail-closed gate: a degraded die surface must not settle
+        // claims with half-transformed death data (see EnforcerCompat).
+        if (!com.solidus.enforcer.compat.EnforcerCompat.killPipelineAvailable()) {
+            com.solidus.enforcer.compat.EnforcerCompat.logKillPipelineRefusedOnce(LOGGER);
+            return;
+        }
         UUID victimUuid = victim.getUUID();
         this.storage.claimBountiesForTarget(victimUuid).thenAcceptAsync(claimed -> {
             if (claimed.isEmpty()) {

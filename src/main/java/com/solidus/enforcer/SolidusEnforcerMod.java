@@ -67,6 +67,12 @@ public final class SolidusEnforcerMod implements DedicatedServerModInitializer {
     public void onInitializeServer() {
         instance = this;
         LOGGER.info("Initializing Solidus Enforcer...");
+        // ── Update-resilience (WS-C C-2ج, Core's audit W-3 transplanted) ──
+        // Reflectively verify the two mixin surfaces (hurtServer + die) BEFORE
+        // anything can use them. On failure the affected pipeline degrades
+        // loudly (bounty placements refused, claims suspended) while commands,
+        // storage, licenses and admin views keep working — the server boots on.
+        com.solidus.enforcer.compat.EnforcerCompat.verifyCompatibility();
         ServerLifecycleEvents.SERVER_STARTED.register(this::onServerStarted);
         ServerLifecycleEvents.SERVER_STOPPING.register(this::onServerStopping);
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
@@ -75,6 +81,12 @@ public final class SolidusEnforcerMod implements DedicatedServerModInitializer {
             EnforcerAdminCommand.register((CommandDispatcher<CommandSourceStack>) dispatcher, this);
         });
         ServerTickEvents.END_SERVER_TICK.register(this::onServerTick);
+        // By the first JOIN the ServerPlayer class has necessarily initialized,
+        // so both mixins have applied or definitively failed (require=0 warning).
+        // Cross-check the probe results against the actual apply events.
+        net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.JOIN
+            .register((handler, sender, server) ->
+                com.solidus.enforcer.compat.EnforcerCompat.confirmMixinsAfterFirstConnection());
         LOGGER.info("Solidus Enforcer initialized (awaiting server start for full activation)");
     }
 

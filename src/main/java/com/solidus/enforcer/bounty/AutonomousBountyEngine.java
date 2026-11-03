@@ -46,6 +46,13 @@ public final class AutonomousBountyEngine {
         if (!this.config.isAutonomousBountiesEnabled()) {
             return;
         }
+        // C-2ج: the autonomous engine spends treasury money on bounties that
+        // could never be claimed while the kill pipeline is degraded — skip
+        // the whole cycle (placements, not views) with one clear log line.
+        if (!com.solidus.enforcer.compat.EnforcerCompat.killPipelineAvailable()) {
+            com.solidus.enforcer.compat.EnforcerCompat.logKillPipelineRefusedOnce(LOGGER);
+            return;
+        }
         this.checkMonopolyPlayers(server);
         this.checkKillStreakPlayers(server);
     }

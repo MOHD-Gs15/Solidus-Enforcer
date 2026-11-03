@@ -5,6 +5,8 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.context.CommandContext;
 import com.solidus.enforcer.SolidusEnforcerMod;
 import com.solidus.enforcer.bounty.BountyEntry;
+import com.solidus.enforcer.compat.EnforcerCompatState;
+import com.solidus.enforcer.compat.EnforcerMixinPlugin;
 import com.solidus.enforcer.util.TextUtil;
 import java.util.List;
 import net.minecraft.commands.CommandSourceStack;
@@ -39,6 +41,7 @@ public final class EnforcerAdminCommand {
                         .executes(ctx -> executeCancel(ctx, mod))));
         enforcer.then(Commands.literal("stats").executes(ctx -> executeStats(ctx, mod)));
         enforcer.then(Commands.literal("reload").executes(ctx -> executeReload(ctx, mod)));
+        enforcer.then(Commands.literal("compat").executes(ctx -> executeCompat(ctx)));
 
         dispatcher.register(enforcer);
     }
@@ -154,5 +157,59 @@ public final class EnforcerAdminCommand {
         ctx.getSource().sendSuccess(() -> TextUtil.branded(
                 "Solidus Enforcer configuration reloaded.", TextUtil.COLOR_GOOD), true);
         return 1;
+    }
+
+    /**
+     * /enforcer compat — the C-2ج diagnostic twin of Core's /solidus-admin compat:
+     * both mixin surfaces, the plugin apply-flags and the resulting pipeline
+     * state, readable even before SERVER_STARTED (probes run at mod init).
+     */
+    private static int executeCompat(CommandContext<CommandSourceStack> ctx) {
+        boolean verified = EnforcerCompatState.isVerified();
+        boolean damageOk = EnforcerCompatState.isDamageTelemetryAvailable();
+        boolean killOk = EnforcerCompatState.isKillPipelineAvailable();
+
+        MutableComponent msg = TextUtil.prefix()
+                .append(Component.literal("Compatibility report (family 2.4.0):")
+                        .withColor(TextUtil.COLOR_HEADER));
+        msg.append(Component.literal("\n  Startup probe: " + (verified ? "ran" : "not run yet"))
+                .withColor(verified ? TextUtil.COLOR_INFO : TextUtil.COLOR_MUTED));
+
+        msg.append(Component.literal("\n  Damage surface (hurtServer): " + (damageOk ? "OK" : "FAILED"))
+                .withColor(damageOk ? TextUtil.COLOR_GOOD : TextUtil.COLOR_BAD));
+        if (!damageOk) {
+            for (String failure : EnforcerCompatState.damageFailures()) {
+                msg.append(Component.literal("\n    - " + failure).withColor(TextUtil.COLOR_BAD));
+            }
+        }
+        msg.append(mixinLine("Damage mixin applied: ", EnforcerMixinPlugin.isDamageMixinApplied()));
+
+        msg.append(Component.literal("\n  Kill surface (die): " + (killOk ? "OK" : "FAILED"))
+                .withColor(killOk ? TextUtil.COLOR_GOOD : TextUtil.COLOR_BAD));
+        if (!killOk) {
+            for (String failure : EnforcerCompatState.killFailures()) {
+                msg.append(Component.literal("\n    - " + failure).withColor(TextUtil.COLOR_BAD));
+            }
+        }
+        msg.append(mixinLine("Death mixin applied: ", EnforcerMixinPlugin.isDeathMixinApplied()));
+
+        String pipeline = killOk
+                ? "OPERATIONAL"
+                : "DEGRADED — placements refused, claims suspended; storage, licenses and admin views keep working";
+        msg.append(Component.literal("\n  Bounty/kill pipeline: " + pipeline)
+                .withColor(killOk ? TextUtil.COLOR_GOOD : TextUtil.COLOR_BAD));
+
+        ctx.getSource().sendSuccess(() -> msg, false);
+        return 1;
+    }
+
+    /** "true" or the honest "pending" line — ServerPlayer initializes lazily. */
+    private static MutableComponent mixinLine(String label, boolean applied) {
+        MutableComponent line = Component.literal("\n  " + label);
+        if (applied) {
+            return line.append(Component.literal("true").withColor(TextUtil.COLOR_GOOD));
+        }
+        return line.append(Component.literal("pending (applies at the first player connection)")
+                .withColor(TextUtil.COLOR_MUTED));
     }
 }

@@ -14,13 +14,30 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 /**
  * Records successful PvP damage for the alliance split. Self-damage and
  * non-player sources are filtered here so the pipeline only sees real PvP.
+ *
+ * <p>UPDATE RESILIENCE (WS-C C-2ج, Core's audit W-3 pattern transplanted):
+ * this injector declares {@code require = 0}. When a future Minecraft
+ * version reshapes {@code hurtServer} (a 26.x line already moved
+ * {@code Player#drop} behind {@code Prediction}), the injection logs a
+ * WARNING and is skipped — the server still boots. The safety net is
+ * layered: {@code com.solidus.enforcer.compat.EnforcerCompatProbes}
+ * reflectively verifies the exact shape at startup, the
+ * {@code EnforcerCompat.damageTelemetryAvailable()} gate at the top of
+ * this callback fails closed, and the first JOIN cross-check catches a
+ * silently-missing apply. A degraded damage surface flattens alliance
+ * splits to killer-takes-all; it never crashes the server.</p>
  */
 @Mixin(ServerPlayer.class)
 public abstract class ServerPlayerDamageMixin {
 
-    @Inject(method = {"hurtServer"}, at = {@At(value = "RETURN")})
+    @Inject(method = {"hurtServer"}, at = {@At(value = "RETURN")}, require = 0)
     private void onPlayerHurt(ServerLevel level, DamageSource source, float amount,
                                CallbackInfoReturnable<Boolean> cir) {
+        // Fail-closed gate (C-2ج): a surface that failed verification must
+        // not feed half-transformed data into the alliance-split pipeline.
+        if (!com.solidus.enforcer.compat.EnforcerCompat.damageTelemetryAvailable()) {
+            return;
+        }
         if (!Boolean.TRUE.equals(cir.getReturnValue())) {
             return;
         }

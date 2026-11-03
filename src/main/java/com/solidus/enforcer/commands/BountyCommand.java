@@ -63,6 +63,12 @@ public final class BountyCommand {
         ServerPlayer target = EntityArgument.getPlayer(ctx, "target");
         double amount = DoubleArgumentType.getDouble(ctx, "amount");
 
+        // C-2ج: a placement escrows money that could never be claimed while
+        // the kill pipeline is degraded — refuse with a clear message instead.
+        if (!com.solidus.enforcer.compat.EnforcerCompat.ensureKillPipelineAvailable(ctx.getSource())) {
+            return 0;
+        }
+
         BountyManager bountyManager = mod.getBountyManager();
         HunterLicenseManager licenseManager = mod.getLicenseManager();
         if (bountyManager == null || licenseManager == null) {
