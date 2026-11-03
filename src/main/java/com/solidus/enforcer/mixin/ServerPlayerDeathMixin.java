@@ -17,12 +17,27 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * value-drop check, the victim may already have respawned with a fresh
  * inventory, which used to distort payouts (players could die naked, respawn,
  * and claim "rich" payouts).
+ *
+ * <p>UPDATE RESILIENCE (WS-C C-2ج, Core's audit W-3 pattern transplanted):
+ * this injector declares {@code require = 0}. When a future Minecraft
+ * version reshapes {@code die}, the injection logs a WARNING and is
+ * skipped — the server still boots. The probes + the
+ * {@code EnforcerCompat.killPipelineAvailable()} gate at the top of this
+ * callback + the first-JOIN cross-check degrade the bounty/death-pool path
+ * loudly (placements refused, claims suspended, storage and admin views
+ * untouched) instead of crashing startup — the exact failure mode that
+ * made every un-updated server fall over on MC updates.</p>
  */
 @Mixin(ServerPlayer.class)
 public abstract class ServerPlayerDeathMixin {
 
-    @Inject(method = {"die"}, at = {@At(value = "HEAD")})
+    @Inject(method = {"die"}, at = {@At(value = "HEAD")}, require = 0)
     private void onPlayerDeath(DamageSource source, CallbackInfo ci) {
+        // Fail-closed gate (C-2ج): a degraded kill pipeline must not settle
+        // claims with half-transformed death data.
+        if (!com.solidus.enforcer.compat.EnforcerCompat.killPipelineAvailable()) {
+            return;
+        }
         if (!(source.getEntity() instanceof ServerPlayer killer)) {
             return;
         }
