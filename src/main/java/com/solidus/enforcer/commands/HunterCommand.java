@@ -23,6 +23,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.Prediction;
 
 /**
  * /hunter [menu] | /hunter tiers | /hunter buy <tier> | /hunter info | /hunter track <target>
@@ -256,7 +257,11 @@ public final class HunterCommand {
         var compass = CompassUtil.createLiveTrackingCompass(target.getName().getString(), level,
                 x, y, z, tier.name(), accuracy);
         if (!hunter.getInventory().add(compass)) {
-            hunter.drop(compass, false);
+            // 26.3: Player.drop(ItemStack, boolean) left Player; ServerPlayer now
+            // exposes drop(ItemStack, boolean, Prediction) only. SERVER_ONLY is the
+            // server-initiated recovery drop (client never predicted this compass),
+            // pinned behaviorally by the family boot drill: exactly one ground entity.
+            hunter.drop(compass, false, Prediction.SERVER_ONLY);
         }
         trackerStart(mod, hunter, target, tier);
         hunter.sendSystemMessage(TextUtil.branded(
